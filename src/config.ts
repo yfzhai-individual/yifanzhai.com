@@ -4,11 +4,9 @@ export const site = {
   description:
     'Yifan Zhai is a software engineer working across product security and AI automation.',
   url: 'https://yifanzhai.com',
-  email: '',
-  resume: '',
   social: {
     github: 'https://github.com/yfzhai-individual',
-    linkedin: '',
+    linkedin: 'https://www.linkedin.com/in/yifanzhai/',
   },
 } as const;
 

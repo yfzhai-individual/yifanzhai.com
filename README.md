@@ -60,11 +60,11 @@ The filename becomes the URL: `secure-build-pipeline.mdx` becomes `/projects/sec
 
 The post automatically appears on the Writing page, in the homepage's recent writing section, in the sitemap, and in `/rss.xml`. Level-two and level-three headings generate the table of contents. Fenced code blocks receive syntax highlighting.
 
-## Update profile details
+## Update public profile details
 
-Edit `src/config.ts` to add the final LinkedIn URL, résumé path, and email address. Empty fields render as honest placeholders rather than invented links.
+Edit `src/config.ts` to update the public GitHub and LinkedIn URLs.
 
-If the résumé is a file, place it in `public/` and set `resume` to a root-relative path such as `/yifan-zhai-resume.pdf`.
+Email and résumé details are intentionally not stored or displayed. If either becomes public later, add it deliberately rather than placing private information in the repository.
 
 ## Deploy to Cloudflare Pages
 
@@ -100,9 +100,14 @@ Vercel references: [Astro on Vercel](https://vercel.com/docs/frameworks/frontend
 
 ## Content still needed
 
-- LinkedIn profile URL
-- Preferred public email address
-- Résumé file or URL
 - Career timeline and selected work
 - First public project
 - First public article
+
+## Optional domain email
+
+If a public address is useful later, `hello@yifanzhai.com` is a clear, durable choice. Keep the current Gmail address private and forward the public address to it.
+
+With Cloudflare DNS, enable **Email Routing**, verify the private destination address, then create a routing rule from `hello@yifanzhai.com` to that destination. Forwarding handles incoming mail only. To send and reply as `hello@yifanzhai.com`, use a mailbox or SMTP provider that supports the custom domain and configure SPF, DKIM, and DMARC before publishing the address.
+
+Cloudflare reference: [route incoming email](https://developers.cloudflare.com/email-service/get-started/route-emails/).

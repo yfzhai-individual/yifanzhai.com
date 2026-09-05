@@ -18,9 +18,7 @@ const posts = (await getCollection('writing', ({ data }) => !data.draft))
         <p class="lede">I build dependable software, strengthen the systems around it, and use automation to make careful work scale.</p>
         <div class="link-row" aria-label="Profile links">
           <a class="text-link" href={site.social.github} rel="me">GitHub</a>
-          {site.social.linkedin ? <a class="text-link" href={site.social.linkedin} rel="me">LinkedIn</a> : <span>LinkedIn · add link</span>}
-          {site.resume ? <a class="text-link" href={site.resume}>Résumé</a> : <span>Résumé · add link</span>}
-          {site.email ? <a class="text-link" href={`mailto:${site.email}`}>Email</a> : <span>Email · add address</span>}
+          <a class="text-link" href={site.social.linkedin} rel="me">LinkedIn</a>
         </div>
       </div>
       <p class="hero-note"><span>Current focus</span>Engineering secure, useful systems at the intersection of product thinking and AI.</p>
