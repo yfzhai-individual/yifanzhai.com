@@ -71,10 +71,19 @@ const personSchema = {
     <script>
       const root = document.documentElement;
       const themeButton = document.querySelector<HTMLButtonElement>('#theme-toggle');
+      const syncThemeButton = () => {
+        if (!themeButton) return;
+        const target = root.dataset.theme === 'dark' ? 'light' : 'dark';
+        const label = `Switch to ${target} mode`;
+        themeButton.setAttribute('aria-label', label);
+        themeButton.title = label;
+      };
+      syncThemeButton();
       themeButton?.addEventListener('click', () => {
         const next = root.dataset.theme === 'dark' ? 'light' : 'dark';
         root.dataset.theme = next;
         localStorage.setItem('theme', next);
+        syncThemeButton();
       });
 
       const menuButton = document.querySelector<HTMLButtonElement>('#menu-toggle');
