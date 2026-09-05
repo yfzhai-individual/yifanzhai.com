@@ -1,0 +1,11 @@
+---
+import { navigation } from '../config';
+const items = [{ href: '/', label: 'Home' }, ...navigation];
+---
+
+<dialog id="command-dialog" aria-label="Navigation palette">
+  <input class="command-input" id="command-input" type="search" placeholder="Go to…" autocomplete="off" aria-label="Filter pages" />
+  <ul class="command-list" id="command-list">
+    {items.map((item, index) => <li><a href={item.href}><span>{item.label}</span><small>{index + 1}</small></a></li>)}
+  </ul>
+</dialog>

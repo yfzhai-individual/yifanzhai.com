@@ -1,0 +1,21 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import PageHeader from '../../components/PageHeader.astro';
+import ProjectCard from '../../components/ProjectCard.astro';
+
+const projects = (await getCollection('projects', ({ data }) => !data.draft)).sort((a, b) => a.data.title.localeCompare(b.data.title));
+---
+
+<BaseLayout title="Projects" description="Selected projects by Yifan Zhai.">
+  <PageHeader eyebrow="Archive" title="Projects" description="Things built to solve a problem, test an idea, or make a system more dependable." />
+  <section class="section shell">
+    {projects.length ? (
+      <ul class="project-grid">
+        {projects.map((project) => <ProjectCard href={`/projects/${project.id}/`} title={project.data.title} summary={project.data.summary} status={project.data.status} tags={project.data.tags} />)}
+      </ul>
+    ) : (
+      <div class="empty-state"><div><strong>Nothing public yet.</strong><p>The collection and detailed project-page system are ready. The first real entry can be added without changing a component.</p></div><span class="mono muted" style="font-size: .75rem">src/content/projects</span></div>
+    )}
+  </section>
+</BaseLayout>

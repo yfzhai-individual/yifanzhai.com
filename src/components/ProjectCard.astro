@@ -1,0 +1,20 @@
+---
+interface Props {
+  href: string;
+  title: string;
+  summary: string;
+  status: string;
+  tags: string[];
+  headingLevel?: 'h2' | 'h3';
+}
+const { href, title, summary, status, tags, headingLevel = 'h2' } = Astro.props;
+const Heading = headingLevel;
+---
+
+<li class="project-card">
+  <a href={href}>
+    <div class="project-card-top"><span>{status}</span><span>{tags.slice(0, 2).join(' · ')}</span></div>
+    <Heading>{title}</Heading>
+    <p>{summary}</p>
+  </a>
+</li>

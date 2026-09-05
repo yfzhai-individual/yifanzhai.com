@@ -1,0 +1,15 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import PageHeader from '../components/PageHeader.astro';
+import { site } from '../config';
+---
+
+<BaseLayout title="Contact" description="Get in touch with Yifan Zhai.">
+  <PageHeader eyebrow="Contact" title="Say hello." description="The best conversations usually start with a clear note and a little context." />
+  <section class="section shell">
+    <div class="empty-state">
+      <div><strong>Contact details are being added.</strong><p>Until then, GitHub is the public way to find Yifan online.</p></div>
+      <a class="text-link" href={site.social.github}>GitHub</a>
+    </div>
+  </section>
+</BaseLayout>
