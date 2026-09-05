@@ -1,21 +1,23 @@
 ---
 import { getCollection, render } from 'astro:content';
 import ArticleLayout from '../../layouts/ArticleLayout.astro';
+import { formatCalendarDate } from '../../utils/dates';
+import { isVisibleWritingPost } from '../../utils/writing';
 
 export async function getStaticPaths() {
-  const posts = await getCollection('writing', ({ data }) => !data.draft);
+  const posts = await getCollection('writing', isVisibleWritingPost);
   return posts.map((post) => ({ params: { id: post.id }, props: { post } }));
 }
 
 const { post } = Astro.props;
 const { Content, headings } = await render(post);
-const date = post.data.publishedAt.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+const date = formatCalendarDate(post.data.publishedAt);
 ---
 
 <ArticleLayout
   title={post.data.title}
   description={post.data.description}
-  eyebrow="Writing"
+  eyebrow={post.data.draft ? 'Writing / Draft' : 'Writing'}
   meta={date}
   tags={post.data.tags}
   headings={headings}

@@ -14,15 +14,23 @@ npm run dev
 ```
 
 Astro will print the local address, normally `http://localhost:4321`.
+Use `npm run dev:drafts` when you also want local article routes and the writing index to include drafts.
 
 Before publishing a change:
 
 ```bash
-npm run build
+npm run validate
 npm run preview
 ```
 
 The production site is generated in `dist/`.
+
+## Content workflows
+
+- [Writing technical articles](docs/WRITING.md)
+- [Publishing through pull requests and Cloudflare previews](docs/PUBLISHING.md)
+
+`npm run validate` performs the existing Astro/type/content checks and a production build. Formatting and comprehensive broken-link checking are not currently automated.
 
 ## Project structure
 
@@ -53,10 +61,10 @@ The filename becomes the URL: `secure-build-pipeline.mdx` becomes `/projects/sec
 
 ## Add a blog post
 
-1. Copy `src/content/writing/_template.mdx` to a descriptive filename.
-2. Add a title, summary, publication date, and tags.
-3. Write the post in Markdown or MDX.
-4. Set `draft: false` when it is ready.
+1. Run `npm run new:post -- <slug>` with an evergreen lowercase kebab-case slug.
+2. Add the title, description, tags, and article body to the generated MDX draft.
+3. Preview it with `npm run dev:drafts`.
+4. Set `draft: false` only when it is ready for a publishing pull request.
 
 The post automatically appears on the Writing page, in the homepage's recent writing section, in the sitemap, and in `/rss.xml`. Level-two and level-three headings generate the table of contents. Fenced code blocks receive syntax highlighting.
 
