@@ -1,0 +1,355 @@
+---
+title: "What happens when you enter a URL in your browser?"
+description: "Tracing yifanzhai.com through DNS—from my laptop through the root and .com nameservers to Cloudflare—and asking what happens if DNS lies."
+publishedAt: 2026-09-06
+tags: [dns, networking, security]
+draft: false
+---
+
+It is one of those interview questions that sounds simple until you try to answer it:
+
+> What actually happens after I type `yifanzhai.com` into Chrome and press Enter?
+
+There are many layers hiding behind that one action. The browser has to find an IP address, establish a connection, negotiate TLS, send HTTP, and eventually render a page. I am going to start with only the first mystery:
+
+> My browser knows the domain name, but the network needs an IP address. Who tells it where `yifanzhai.com` lives—and why should I trust the answer?
+
+## A name is not an address
+
+A domain name is a human-friendly identifier. An IP address is what the network uses to route packets toward a destination.
+
+```text
+yifanzhai.com     human-friendly name
+       |
+       | DNS lookup
+       v
+104.21.49.85      network address
+```
+
+That picture is intentionally incomplete. One name can resolve to several IP addresses, one IP can serve many names, and the answer can change over time. But it gives me a concrete first question to ask my computer.
+
+## First clue: `dig`
+
+I ran:
+
+```bash
+dig yifanzhai.com
+```
+
+Here is the useful part of the real response from my Mac. I removed protocol details that I do not need yet, but I did not replace the values with made-up examples.
+
+```text
+;; QUESTION SECTION:
+;yifanzhai.com.          IN      A
+
+;; ANSWER SECTION:
+yifanzhai.com.   300     IN      A       104.21.49.85
+yifanzhai.com.   300     IN      A       172.67.160.112
+
+;; Query time: 35 msec
+;; SERVER: 2001:558:feed::1#53(2001:558:feed::1)
+```
+
+There is already quite a lot hiding in these few lines.
+
+- `A` means I asked for IPv4 address records.
+- I received two answers: `104.21.49.85` and `172.67.160.112`.
+- `300` is the time to live, or TTL, in seconds. A resolver may cache each record for up to five minutes from the time it receives it.
+- The query took 35 milliseconds from this particular machine and network at this particular moment.
+- `2001:558:feed::1#53` is the recursive resolver that answered `dig`; it is not an authoritative nameserver for my domain. The address belongs to Comcast/Xfinity, and `53` is the DNS port.
+
+The two addresses also do not mean that my origin server has exactly two network interfaces. My site is proxied by Cloudflare, so public DNS returns Cloudflare edge addresses. DNS has told the client where to meet Cloudflare rather than exposing a complete map of the infrastructure behind it.
+
+That raised the next question: if Comcast answered me, where did Comcast get the answer?
+
+## Following DNS without the shortcut
+
+To expose the delegation path, I ran:
+
+```bash
+dig +trace yifanzhai.com
+```
+
+The real output is long because it includes multiple nameservers, IPv4 and IPv6 addresses, TTLs, and DNS metadata. The following is an **abridged and annotated** version of the important path—not a verbatim terminal response:
+
+```text
+# 1. Start at the DNS root
+.                  IN  NS  i.root-servers.net.
+
+# 2. A root server points toward the .com nameservers
+com.               IN  NS  k.gtld-servers.net.
+
+# 3. A .com server returns the delegation for my domain
+yifanzhai.com.     IN  NS  cory.ns.cloudflare.com.
+yifanzhai.com.     IN  NS  hattie.ns.cloudflare.com.
+
+# 4. Cloudflare's authoritative DNS returns the A records
+yifanzhai.com.     IN  A   104.21.49.85
+yifanzhai.com.     IN  A   172.67.160.112
+```
+
+The path looks like this:
+
+```text
+dig +trace
+    |
+    | "Who handles .com?"
+    v
+DNS root
+    |
+    | "Ask a .com TLD nameserver"
+    v
+.com TLD DNS
+    |
+    | "Ask cory.ns.cloudflare.com or
+    |  hattie.ns.cloudflare.com"
+    v
+Cloudflare authoritative DNS
+    |
+    | "Here are the A records"
+    v
+104.21.49.85 / 172.67.160.112
+```
+
+The first surprise was that neither the root server nor the `.com` server knew my website's IP address.
+
+### The root knows where to continue
+
+The DNS root is the top of this naming hierarchy. When asked about `yifanzhai.com`, a root server does not return my final `A` records. It returns a referral toward the nameservers responsible for `.com`.
+
+That is its job: not to remember every website, but to know where each top-level domain begins. IANA coordinates management of the DNS root zone and publishes the authoritative root-zone information.
+
+### `.com` knows my delegation
+
+The `.com` nameservers do not need to store the IP address of my site either. They serve the delegation for `yifanzhai.com`, which says that these nameservers are authoritative:
+
+```text
+cory.ns.cloudflare.com
+hattie.ns.cloudflare.com
+```
+
+In other words, `.com` says, "Cloudflare is the source of truth for this domain. Ask Cloudflare."
+
+### Cloudflare knows my records
+
+Cloudflare's authoritative nameservers hold the DNS zone containing records for `yifanzhai.com`. They can finally answer the `A` query with the two IPv4 addresses I saw earlier.
+
+"DNS provider" is an overloaded phrase, so I find it useful to separate the roles:
+
+| Role | What it does | In this lookup |
+| --- | --- | --- |
+| Registrar | Manages the domain registration and where its delegation points | The company where I manage the domain |
+| Registry / TLD operator | Maintains `.com` registration data; the `.com` nameservers serve delegations | Points `yifanzhai.com` toward Cloudflare's nameservers |
+| Authoritative DNS provider | Publishes the source-of-truth records for the domain | Cloudflare |
+| Recursive resolver | Finds or caches answers on behalf of a client | Comcast/Xfinity at `2001:558:feed::1` |
+
+These systems cooperate, but they are not interchangeable.
+
+## Did Chrome really do that entire trace?
+
+No—probably not.
+
+`dig +trace` deliberately performs iterative queries so I can see the hierarchy. Normal browsing usually delegates that work to a recursive resolver:
+
+```text
+Chrome
+   |
+   v
+browser / operating-system DNS machinery
+   |
+   v
+recursive resolver
+   |
+   +--> cached answer, if still valid
+   |
+   +--> root -> .com -> authoritative DNS, if needed
+   |
+   v
+answer returned to Chrome
+```
+
+There are more wrinkles—Chrome has its own host cache and may use Secure DNS—but the corrected mental model is already useful: my browser usually does not ask a root server directly every time I open a page.
+
+The recursive resolver does the chasing and remembers answers. This is why the TTL in my first response matters.
+
+## Why DNS is not painfully slow every time
+
+The `300` beside each `A` record is a cache lifetime measured in seconds.
+
+```text
+First lookup
+client -> recursive resolver -> DNS hierarchy -> answer
+                              -> cache for up to 300 seconds
+
+Later lookup
+client -> recursive resolver cache -> answer
+```
+
+Caching avoids repeating the whole chain for every page load. It also creates a tradeoff:
+
+- A longer TTL reduces repeated DNS work and can improve cache hit rates.
+- A shorter TTL lets new records become visible sooner.
+- A DNS change is not instantly visible everywhere because existing caches may keep the previous answer until its TTL expires.
+
+Running the lookup twice can make this visible:
+
+```bash
+dig yifanzhai.com
+dig yifanzhai.com
+```
+
+The TTL may decrease between responses if both queries hit the same cached entry. The query time may also change. Neither behavior is guaranteed: load balancing, multiple resolver nodes, and refreshed cache entries can all affect what I observe. The actual output matters more than the tidy classroom prediction.
+
+## Why can't I browse to the IP directly?
+
+At this point I had two IP addresses, so I tried the obvious shortcut: I put one into the browser. Cloudflare responded with Error 1003, "Direct IP access not allowed."
+
+Depending on the exact URL and client, an HTTPS request may instead fail even earlier if the certificate is not valid for the IP address. The result depends on whether I use HTTP or HTTPS and how the client performs certificate verification.
+
+The deeper reason is that an IP address alone does not uniquely identify a modern website. A single edge address can serve many hostnames. The name continues to matter after DNS:
+
+```text
+DNS    yifanzhai.com -> which IP should I contact?
+TLS    SNI            -> which hostname am I securing a connection to?
+HTTP   Host header    -> which website am I requesting?
+```
+
+This is easy to test more carefully with `curl`.
+
+First, ask for the normal HTTPS response headers:
+
+```bash
+curl -I https://yifanzhai.com
+```
+
+Then try the IP directly:
+
+```bash
+curl -I https://172.67.160.112
+```
+
+Finally, bypass DNS while preserving the hostname at the TLS and HTTP layers:
+
+```bash
+curl -I \
+  --resolve yifanzhai.com:443:172.67.160.112 \
+  https://yifanzhai.com
+```
+
+`--resolve` acts like a temporary, command-scoped DNS override. `curl` connects to the chosen IP but still uses `yifanzhai.com` as the URL hostname, so TLS certificate verification, SNI, and the HTTP host all keep the correct name.
+
+Merely adding `-H 'Host: yifanzhai.com'` to an HTTPS request is not equivalent. That header belongs to HTTP, which happens after the TLS handshake; it does not by itself set the hostname used for TLS verification and SNI.
+
+This experiment exposed a boundary I had blurred at first:
+
+> DNS finds an address. It does not, by itself, prove that the machine at that address is the authentic website.
+
+## Why use Cloudflare nameservers at all?
+
+My domain has to be delegated to some authoritative DNS provider. In this setup, that provider is Cloudflare.
+
+Cloudflare hosts the DNS zone and can publish `A`, `AAAA`, `CNAME`, `MX`, and `TXT` records. It can also sit in the web traffic path as a reverse proxy and provide caching, TLS termination, WAF, and DDoS protection. Authoritative DNS and reverse proxying are separate roles even when one company provides both.
+
+This convenience also makes the Cloudflare account a critical security control point. Someone who gains control of the authoritative DNS configuration could change records and send users toward a different destination.
+
+Typing the correct domain is not enough if the system answering for that domain has been compromised.
+
+## What if DNS lies?
+
+Suppose I ask:
+
+```text
+Where is yifanzhai.com?
+```
+
+The legitimate answer is:
+
+```text
+yifanzhai.com -> Cloudflare edge IP
+```
+
+But an attacker wants me to receive:
+
+```text
+yifanzhai.com -> attacker-controlled IP
+```
+
+There are several places to worry about: the path to my recursive resolver, the resolver itself, cached data, the registrar account, and the authoritative DNS account. "DNS security" is not one feature because these are different threats.
+
+Here is the security checkpoint for what I have observed so far:
+
+| Question | Answer |
+| --- | --- |
+| Asset | The DNS answer and the privacy of the hostname I queried |
+| Potential attacker | A malicious network observer, compromised resolver, or attacker controlling domain/DNS configuration |
+| Trust boundary | My device handing the query to a resolver; the delegation crossing between DNS operators |
+| Desired property | Integrity/authenticity of the answer, plus privacy while the query travels |
+| Failure mode | I connect to the wrong address or reveal what names I am looking up |
+
+## What Secure DNS changes—and what it does not
+
+Traditional DNS commonly sends queries to the resolver without transport encryption. Someone able to observe that path may learn which names I request, and an active attacker on the path may try to tamper with unprotected traffic.
+
+DNS over HTTPS (DoH) carries the DNS conversation inside HTTPS:
+
+```text
+Traditional DNS
+client -------- plaintext DNS --------> resolver
+
+DNS over HTTPS
+client ===== encrypted HTTPS tunnel ===> resolver
+```
+
+In Chrome, the current setting is under:
+
+```text
+Settings -> Privacy and security -> Security -> Use secure DNS
+```
+
+It is worth inspecting rather than assuming Chrome always uses Google or Cloudflare. Depending on configuration and policy, Chrome may upgrade the current provider, use a selected provider, or leave Secure DNS disabled.
+
+DoH protects the transport between the client and the resolver. It does **not** make the resolver omniscient or automatically trustworthy, and it does not authenticate the web server at the returned IP.
+
+DNSSEC solves a different problem. It lets a validating resolver cryptographically check signed DNS data through a chain of trust. It does not hide the query, and it is not a replacement for HTTPS.
+
+```text
+DoH / DoT   -> privacy and integrity on the path to a resolver
+DNSSEC      -> authenticity and integrity of signed DNS data
+TLS         -> authenticate the web endpoint and protect the connection
+```
+
+Keeping those properties separate prevents a dangerously vague conclusion like "encrypted DNS makes the website secure."
+
+## The answer created a better question
+
+I started with:
+
+> Who tells my browser where `yifanzhai.com` lives?
+
+Now I have a better mental model:
+
+```text
+domain name
+    |
+    v
+recursive resolver and cache
+    |
+    v
+root -> .com -> authoritative DNS
+    |
+    v
+one or more IP addresses
+```
+
+DNS answered, **"Where should I connect?"** It did not completely answer, **"Whom did I reach?"**
+
+If an attacker can make `yifanzhai.com` resolve to the wrong IP address, why does Chrome not quietly accept the attacker's server?
+
+That question leads to TLS, certificates, certificate authorities, and the browser's chain of trust—and that is the next investigation.
+
+## References
+
+- [IANA: Root Zone Management](https://www.iana.org/domains/root)
+- [Chromium: DNS over HTTPS](https://www.chromium.org/developers/dns-over-https/)
+- [Cloudflare: Error 1003—Direct IP access not allowed](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1003/)
+- [curl manual: `--resolve`](https://curl.se/docs/manpage.html#--resolve)
