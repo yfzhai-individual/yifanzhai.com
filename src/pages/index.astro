@@ -3,11 +3,13 @@ import { getCollection } from 'astro:content';
 import BaseLayout from '../layouts/BaseLayout.astro';
 import { site } from '../config';
 import { compareDatesDescending, formatCalendarDate, toCalendarDateValue } from '../utils/dates';
+import { isVisibleWritingPost } from '../utils/writing';
 
 const projects = (await getCollection('projects', ({ data }) => !data.draft && data.featured)).slice(0, 3);
-const posts = (await getCollection('writing', ({ data }) => !data.draft))
-  .sort((a, b) => compareDatesDescending(a.data.publishedAt, b.data.publishedAt))
-  .slice(0, 3);
+const posts = (await getCollection('writing', (post) => isVisibleWritingPost(post) && !post.data.draft))
+  .sort((a, b) => compareDatesDescending(a.data.publishedAt, b.data.publishedAt));
+const [latestPost, ...olderPosts] = posts;
+const recentPosts = olderPosts.slice(0, 4);
 ---
 
 <BaseLayout>
@@ -26,31 +28,48 @@ const posts = (await getCollection('writing', ({ data }) => !data.draft))
     </div>
   </section>
 
-  <section class="section shell">
-    <div class="section-head">
-      <p class="eyebrow">01 / Projects</p>
-      <div><h2 class="section-title">Selected work</h2><p class="section-intro">A focused archive of things built, explored, and learned.</p></div>
-    </div>
-    {projects.length ? (
+  {latestPost && (
+    <section class="section shell">
+      <div class="section-head">
+        <p class="eyebrow">Writing</p>
+        <div><h2 class="section-title">Latest writing</h2><p class="section-intro">Technical writing on software, security, automation, and the details between them.</p></div>
+      </div>
+      <article class="latest-writing">
+        <div class="latest-writing-meta">
+          <time datetime={toCalendarDateValue(latestPost.data.publishedAt)}>{formatCalendarDate(latestPost.data.publishedAt)}</time>
+          {latestPost.data.tags.length > 0 && (
+            <ul class="tag-list" aria-label="Article tags">
+              {latestPost.data.tags.map((tag) => <li class="tag">{tag}</li>)}
+            </ul>
+          )}
+        </div>
+        <div class="latest-writing-copy">
+          <h3><a href={`/writing/${latestPost.id}/`}>{latestPost.data.title}</a></h3>
+          <p>{latestPost.data.description}</p>
+          <a class="text-link" href={`/writing/${latestPost.id}/`}>Read article</a>
+        </div>
+      </article>
+      {recentPosts.length > 0 && (
+        <div class="recent-writing">
+          <h3>Recent writing</h3>
+          <ul class="rule-list">
+            {recentPosts.map((post) => <li class="rule-item"><time class="rule-item-meta" datetime={toCalendarDateValue(post.data.publishedAt)}>{formatCalendarDate(post.data.publishedAt, 'monthYear')}</time><a href={`/writing/${post.id}/`}>{post.data.title}</a><span aria-hidden="true">→</span></li>)}
+          </ul>
+          <a class="text-link" href="/writing/">View all writing</a>
+        </div>
+      )}
+    </section>
+  )}
+
+  {projects.length > 0 && (
+    <section class="section shell">
+      <div class="section-head">
+        <p class="eyebrow">Projects</p>
+        <div><h2 class="section-title">Selected work</h2><p class="section-intro">A focused archive of things built, explored, and learned.</p></div>
+      </div>
       <ul class="rule-list">
         {projects.map((project) => <li class="rule-item"><span class="rule-item-meta">{project.data.status}</span><a href={`/projects/${project.id}/`}>{project.data.title}</a><span aria-hidden="true">→</span></li>)}
       </ul>
-    ) : (
-      <div class="empty-state"><div><strong>The archive starts quietly.</strong><p>Project notes and case studies will appear here as they are ready.</p></div><a class="text-link" href="/projects/">View project structure</a></div>
-    )}
-  </section>
-
-  <section class="section shell">
-    <div class="section-head">
-      <p class="eyebrow">02 / Writing</p>
-      <div><h2 class="section-title">Recent notes</h2><p class="section-intro">Technical writing on software, security, automation, and the details between them.</p></div>
-    </div>
-    {posts.length ? (
-      <ul class="rule-list">
-        {posts.map((post) => <li class="rule-item"><time class="rule-item-meta" datetime={toCalendarDateValue(post.data.publishedAt)}>{formatCalendarDate(post.data.publishedAt, 'monthYear')}</time><a href={`/writing/${post.id}/`}>{post.data.title}</a><span aria-hidden="true">→</span></li>)}
-      </ul>
-    ) : (
-      <div class="empty-state"><div><strong>Notes are coming.</strong><p>The writing system is ready for MDX, tags, code, and long-form technical work.</p></div><a class="text-link" href="/writing/">Visit writing</a></div>
-    )}
-  </section>
+    </section>
+  )}
 </BaseLayout>
