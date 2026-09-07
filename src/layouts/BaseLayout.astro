@@ -97,21 +97,35 @@ const personSchema = {
       const dialog = document.querySelector<HTMLDialogElement>('#command-dialog');
       const commandOpen = document.querySelector<HTMLButtonElement>('#command-open');
       const input = document.querySelector<HTMLInputElement>('#command-input');
-      const links = [...document.querySelectorAll<HTMLAnchorElement>('#command-list a')];
-      const openPalette = () => { dialog?.showModal(); input?.focus(); };
+      const links = [...document.querySelectorAll<HTMLAnchorElement>('.command-result a')];
+      const commandEmpty = document.querySelector<HTMLElement>('#command-empty');
+      const syncCommandResults = () => {
+        const terms = (input?.value.toLowerCase().match(/\S+/g) ?? []).map((term) => term.replace(/^#/, ''));
+        let visibleCount = 0;
+        links.forEach((link) => {
+          const searchText = link.dataset.search?.toLowerCase() ?? '';
+          const matches = terms.every((term) => searchText.includes(term));
+          if (link.parentElement) link.parentElement.hidden = !matches;
+          if (!matches) return;
+          visibleCount += 1;
+        });
+        if (commandEmpty) commandEmpty.hidden = visibleCount > 0;
+      };
+      const openPalette = () => {
+        if (input) input.value = '';
+        syncCommandResults();
+        dialog?.showModal();
+        input?.focus();
+      };
       commandOpen?.addEventListener('click', openPalette);
       document.addEventListener('keydown', (event) => {
         if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
           event.preventDefault();
           dialog?.open ? dialog.close() : openPalette();
         }
-        if (dialog?.open && /^[1-6]$/.test(event.key)) links[Number(event.key) - 1]?.click();
       });
       dialog?.addEventListener('click', (event) => { if (event.target === dialog) dialog.close(); });
-      input?.addEventListener('input', () => {
-        const query = input.value.toLowerCase();
-        links.forEach((link) => { if (link.parentElement) link.parentElement.hidden = !link.textContent?.toLowerCase().includes(query); });
-      });
+      input?.addEventListener('input', syncCommandResults);
     </script>
   </body>
 </html>

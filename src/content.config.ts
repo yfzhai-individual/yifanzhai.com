@@ -19,6 +19,7 @@ const projects = defineCollection({
   schema: z.object({
     title: z.string(),
     summary: z.string(),
+    publishedAt: z.coerce.date().optional(),
     status: z.enum(['active', 'complete', 'archived', 'idea']).default('active'),
     featured: z.boolean().default(false),
     draft: z.boolean().default(false),

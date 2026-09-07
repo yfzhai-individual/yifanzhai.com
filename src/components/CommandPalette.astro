@@ -1,11 +1,43 @@
 ---
+import { getCollection } from 'astro:content';
 import { navigation } from '../config';
-const items = [{ href: '/', label: 'Home' }, ...navigation];
+import { compareDatesDescending } from '../utils/dates';
+import { isVisibleWritingPost } from '../utils/writing';
+
+const pageItems = [{ href: '/', label: 'Home' }, ...navigation].map((item) => ({
+  ...item,
+  meta: 'Page',
+  searchText: `${item.label} page`,
+}));
+const writingItems = (await getCollection('writing', (post) => isVisibleWritingPost(post) && !post.data.draft))
+  .sort((a, b) => compareDatesDescending(a.data.publishedAt, b.data.publishedAt))
+  .map((post) => ({
+    href: `/writing/${post.id}/`,
+    label: post.data.title,
+    meta: post.data.tags.length ? `Writing · ${post.data.tags.map((tag) => `#${tag}`).join(' ')}` : 'Writing',
+    searchText: `${post.data.title} ${post.data.description} ${post.data.tags.join(' ')}`,
+  }));
+const projectItems = (await getCollection('projects', ({ data }) => !data.draft))
+  .sort((a, b) => (b.data.publishedAt?.valueOf() ?? 0) - (a.data.publishedAt?.valueOf() ?? 0))
+  .map((project) => ({
+    href: `/projects/${project.id}/`,
+    label: project.data.title,
+    meta: project.data.tags.length ? `Project · ${project.data.tags.map((tag) => `#${tag}`).join(' ')}` : 'Project',
+    searchText: `${project.data.title} ${project.data.summary} ${project.data.tags.join(' ')}`,
+  }));
+const items = [...pageItems, ...writingItems, ...projectItems];
 ---
 
-<dialog id="command-dialog" aria-label="Navigation palette">
-  <input class="command-input" id="command-input" type="search" placeholder="Go to…" autocomplete="off" aria-label="Filter pages" />
+<dialog id="command-dialog" aria-label="Site search">
+  <input class="command-input" id="command-input" type="search" placeholder="Search pages and writing…" autocomplete="off" aria-label="Search pages and published content" aria-controls="command-list" />
   <ul class="command-list" id="command-list">
-    {items.map((item, index) => <li><a href={item.href}><span>{item.label}</span><small>{index + 1}</small></a></li>)}
+    {items.map((item) => (
+      <li class="command-result">
+        <a href={item.href} data-search={item.searchText}>
+          <span class="command-result-copy"><span>{item.label}</span><small>{item.meta}</small></span>
+        </a>
+      </li>
+    ))}
+    <li class="command-empty" id="command-empty" hidden>No matching pages or published content.</li>
   </ul>
 </dialog>

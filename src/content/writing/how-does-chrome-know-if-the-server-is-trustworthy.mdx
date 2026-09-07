@@ -1,0 +1,393 @@
+---
+title: "How does Chrome know the server is really yifanzhai.com?"
+description: "Inspecting a real certificate, following its trust chain, and breaking one validation check at a time to see why Chrome trusts—or rejects—an HTTPS server."
+publishedAt: 2026-09-07
+tags: [tls, certificates, security]
+draft: false
+---
+
+Our [previous DNS investigation](/writing/what-happens-when-you-enter-a-url/) ended with a question:
+
+> If an attacker can manipulate DNS and make yifanzhai.com resolve to a malicious IP address, how does Chrome prevent the browser from trusting the wrong server?
+
+The attacker may be able to make your browser connect to the wrong IP address. But before Chrome trusts that connection, it still needs to verify:
+
+> Is this server really allowed to act as yifanzhai.com?
+
+TLS answers that question using the website's certificate, the certificate chain, Chrome's list of trusted certificate authorities, and proof that the server actually owns the private key associated with that certificate.
+
+## First clue: the live certificate
+
+I started with a verbose request on September 6, 2026:
+
+```bash
+curl --noproxy '*' -Iv --connect-timeout 15 https://yifanzhai.com/
+```
+
+`-I` requests only the response headers, `-v` exposes connection details, and `--noproxy '*'` makes this particular test connect directly instead of using a configured proxy.
+
+Here is an abridged copy of the real output. I kept the certificate facts and removed IP addresses, request headers, connection identifiers, and other details that are not relevant.
+
+```text
+* SSL connection using TLSv1.3
+* Server certificate:
+*  subject: CN=yifanzhai.com
+*  start date: Sep  5 06:49:51 2026 GMT
+*  expire date: Dec  4 07:49:46 2026 GMT
+*  subjectAltName: host "yifanzhai.com" matched cert's "yifanzhai.com"
+*  issuer: C=US; O=Google Trust Services; CN=WE1
+*  SSL certificate verify ok.
+< HTTP/2 200
+```
+
+The final `200` says the web request succeeded, but several security decisions happened before curl sent that HTTP request:
+
+- The certificate was within its validity window.
+- The name `yifanzhai.com` matched a name in the certificate.
+- The certificate could be connected to a trusted issuer.
+- The TLS peer proved that it possessed the corresponding private key.
+
+This site is proxied by Cloudflare, as the DNS investigation showed. The certificate above is therefore the certificate presented to a visitor at Cloudflare's edge. It does not reveal which certificate, if any, Cloudflare uses when connecting onward to the origin.
+
+Also, curl is not Chrome. Curl and OpenSSL are useful independent observation tools, but they can use different verification code and trust stores. I will use their output to inspect the public evidence, then separate it from the Chrome-specific policy decisions.
+
+## What a certificate contains
+
+A certificate does not contain the server's private key. It contains a public key and claims about how that public key may be used.
+
+I extracted a few extensions from the live leaf certificate:
+
+```bash
+openssl s_client \
+  -connect yifanzhai.com:443 \
+  -servername yifanzhai.com </dev/null 2>/dev/null \
+  | openssl x509 -noout \
+      -ext subjectAltName,basicConstraints,keyUsage,extendedKeyUsage
+```
+
+The returned output was:
+
+```text
+X509v3 Key Usage: critical
+    Digital Signature
+X509v3 Extended Key Usage:
+    TLS Web Server Authentication
+X509v3 Basic Constraints: critical
+    CA:FALSE
+X509v3 Subject Alternative Name:
+    DNS:yifanzhai.com
+```
+
+These fields answer different questions:
+
+| Field | What it tells the verifier |
+| --- | --- |
+| Subject Alternative Name | The DNS names this key is allowed to represent |
+| Validity window | When the certificate may be accepted |
+| Key Usage | Which cryptographic operations the key may perform |
+| Extended Key Usage | That the certificate may be used for TLS server authentication |
+| Basic Constraints | `CA:FALSE` means this is an end-server certificate, not a CA certificate |
+| Issuer and signature | Which CA signed the certificate and whether its contents were changed |
+
+The `CN=yifanzhai.com` line in curl's display is easy to notice, but modern [service-identity verification](https://datatracker.ietf.org/doc/html/rfc9525) uses the DNS names in `subjectAltName`. The Common Name is not the source of truth for matching the hostname.
+
+A useful simplified model is:
+
+```text
+certificate contents
+    hostname: yifanzhai.com
+    public key: ...
+    valid from: ...
+    valid until: ...
+    permitted use: TLS server authentication
+    may issue other certificates: no
+    issuer: Google Trust Services WE1
+    issuer's signature: ...
+```
+
+The issuer's signature makes those fields tamper-resistant. If an attacker changes `yifanzhai.com` to another name or replaces the public key, the signature will no longer match.
+
+## One signature is not enough
+
+Why should my computer trust Google Trust Services `WE1`?
+
+`WE1` is an intermediate certificate authority, not the final trust anchor. I asked OpenSSL to validate both the certificate path and the hostname:
+
+```bash
+openssl s_client \
+  -connect yifanzhai.com:443 \
+  -servername yifanzhai.com \
+  -verify_hostname yifanzhai.com \
+  -verify_return_error </dev/null
+```
+
+The relevant part of the real result was:
+
+```text
+depth=2 C=US, O=Google Trust Services LLC, CN=GTS Root R4
+verify return:1
+depth=1 C=US, O=Google Trust Services, CN=WE1
+verify return:1
+depth=0 CN=yifanzhai.com
+verify return:1
+
+Verification: OK
+Verified peername: yifanzhai.com
+Protocol: TLSv1.3
+Verify return code: 0 (ok)
+```
+
+The numbering runs from the leaf upward:
+
+```text
+depth 0: yifanzhai.com
+             |
+             | signed by
+             v
+depth 1: Google Trust Services WE1
+             |
+             | signed by
+             v
+depth 2: GTS Root R4
+             |
+             v
+        local trust anchor
+```
+
+The verifier checks each certificate in the chain until it reaches a trusted root certificate. The server provides its own certificate and usually the intermediate certificates, while the browser already has the trusted root certificates in its local trust store.
+
+[RFC 5280](https://datatracker.ietf.org/doc/html/rfc5280) defines the standard rules for validating this certificate chain.
+
+The last step is the important one. A root is not trusted because its certificate says, "Trust me," or merely because it is self-signed. It is trusted because the browser or administrator placed it in a trust store through a separate process.
+
+## Trust begins on the client
+
+On platforms where Chrome controls certificate verification, its [built-in certificate verifier](https://chromium.googlesource.com/chromium/src/+/HEAD/net/cert/) obtains publicly trusted roots from the [Chrome Root Store](https://www.chromium.org/Home/chromium-security/root-ca-policy/). Chrome on iOS is an exception because Apple's policies require it to use the platform verifier. Chrome can also consider roots installed by a user or enterprise through platform integrations, then apply browser-specific policy checks even when an operating system verifier considers a path valid.
+
+This makes the trust model partly cryptographic and partly administrative:
+
+```text
+cryptography
+    verifies that certificate signatures and handshake proofs are correct
+
+policy
+    decides which roots, algorithms, certificate profiles, and logs are acceptable
+```
+
+If a company installs its own root certificate on a managed laptop, Chrome may trust internal certificates issued beneath that root. This can be necessary for internal services or enterprise inspection, but it also means control of local trust settings is security sensitive.
+
+## What Chrome needs to check
+
+The complete implementation has many rules, but the core decision can be organized into a short checklist.
+
+### 1. Start with the expected name
+
+Chrome begins with the hostname from the URL:
+
+```text
+https://yifanzhai.com/
+        ^^^^^^^^^^^^^^
+        expected identity
+```
+
+It must decide what name it expects independently of whatever name the server presents. Otherwise, a malicious server could simply choose its own test.
+
+### 2. Match the name in `subjectAltName`
+
+The expected DNS name must match an allowed DNS name in the leaf certificate. Wildcards have limited scope: `*.example.com` can match one left-most label such as `www.example.com`; it does not authorize arbitrary names at arbitrary depths.
+
+This is also why security-sensitive backend code should parse a URL into its components and validate the relevant hostname explicitly instead of treating the entire URL as an undifferentiated string.
+
+### 3. Check time and intended use
+
+The current time must fall between `notBefore` and `notAfter`. The certificate must also permit TLS server authentication and satisfy constraints placed on the leaf and issuer certificates.
+
+### 4. Build a path to a trusted root
+
+The browser validates signatures and constraints through the possible issuer path until it reaches a trust anchor it already accepts. A valid signature from an unknown root is not sufficient.
+
+### 5. Apply browser policy
+
+Chrome applies requirements beyond the simplest chain diagram, including rules for weak keys and signatures, certificate profiles, name constraints, revocation information available through Chrome's mechanisms, and Certificate Transparency.
+
+[Certificate Transparency](https://chromium.googlesource.com/chromium/src/+/HEAD/net/docs/certificate-transparency.md) records publicly trusted certificates in auditable logs. It makes unexpected issuance visible and lets Chrome require evidence that a certificate was logged. It does not, by itself, prove that every logged certificate was issued correctly.
+
+### 6. Require proof of the private key
+
+A certificate is public and copyable. An attacker can download the certificate for `yifanzhai.com` easily.
+
+The certificate therefore cannot authenticate the live peer by itself. In the TLS 1.3 connection I observed, curl reported both of these handshake messages:
+
+```text
+TLS handshake, Certificate
+TLS handshake, CERT verify
+```
+
+The `Certificate` message supplies the public certificate. In [TLS 1.3](https://datatracker.ietf.org/doc/html/rfc9846#section-4.5.2), the `CertificateVerify` message contains a signature over the handshake transcript made with the matching private key. The client verifies that signature with the public key from the leaf certificate.
+
+```text
+certificate chain
+    "This public key is authorized for yifanzhai.com."
+
+CertificateVerify
+    "The peer in this handshake possesses the matching private key."
+```
+
+Someone who simply copies the certificate cannot fake that signature. A detailed TLS handshake and its transcript are a separate investigation; for now, the important distinction is that Chrome validates both an authorization statement and a live proof of key possession.
+
+## Breaking one check at a time
+
+A successful page hides all the checks that passed. The [`badssl.com` test endpoints](https://badssl.com/) deliberately break individual certificate properties, which makes the decision easier to observe.
+
+I ran all three tests directly on September 6, 2026. Each reached a server, but curl exited with code 60 before sending a trusted HTTP request.
+
+### An expired certificate
+
+```bash
+curl --noproxy '*' -Iv --connect-timeout 15 \
+  https://expired.badssl.com/
+```
+
+The relevant result was:
+
+```text
+TLS alert, certificate expired
+SSL certificate problem: certificate has expired
+curl: (60) SSL certificate problem: certificate has expired
+```
+
+The certificate may have valid signatures and the right hostname, but its authorization is no longer within the permitted time window.
+
+### A certificate for the wrong name
+
+```bash
+curl --noproxy '*' -Iv --connect-timeout 15 \
+  https://wrong.host.badssl.com/
+```
+
+The server presented a currently dated certificate, but the name check failed:
+
+```text
+subject: CN=*.badssl.com
+subjectAltName does not match host name wrong.host.badssl.com
+curl: (60) SSL: no alternative certificate subject name matches
+target host name 'wrong.host.badssl.com'
+```
+
+`*.badssl.com` can cover a single label such as `www.badssl.com`. It does not cover the two labels in `wrong.host.badssl.com`.
+
+This failure directly answers the DNS attack from the beginning. Even if false DNS sends the browser to a working TLS server, that server still needs a certificate valid for the hostname the browser expected.
+
+### A self-signed certificate
+
+```bash
+curl --noproxy '*' -Iv --connect-timeout 15 \
+  https://self-signed.badssl.com/
+```
+
+The result was:
+
+```text
+TLS alert, unknown CA
+SSL certificate problem: self signed certificate
+curl: (60) SSL certificate problem: self signed certificate
+```
+
+Self-signing can make a certificate internally consistent, but it does not create trust. The verifier could not build an accepted path from this certificate to one of its configured trust anchors.
+
+The three failures rejected three different propositions:
+
+| Test | Proposition that failed |
+| --- | --- |
+| Expired | "This authorization is valid now." |
+| Wrong host | "This authorization covers the name I requested." |
+| Self-signed | "This authorization leads to a root I already trust." |
+
+A useful caution: curl's `-k` option disables certificate verification. It can make an invalid test endpoint appear to work, but it does not fix the certificate. Use it only for a deliberate test where authentication is not the property being evaluated.
+
+## Who validated what?
+
+The word "validation" hides two different moments.
+
+Before issuing the certificate, a public CA validates that the requester controls the domain according to its issuance procedures. The CA then signs a certificate binding the approved name to a public key.
+
+When Chrome later connects, it does not repeat the CA's domain-control challenge. It validates the resulting evidence and the live handshake:
+
+| Actor | Decision |
+| --- | --- |
+| Certificate authority | Was the requester authorized to receive a certificate for this domain? |
+| Chrome | Does this certificate and handshake satisfy my rules for the hostname the user requested? |
+
+For a normal domain-validated certificate, this proves only that the server is authorized to represent the requested domain and possesses the certificate’s private key. It does not prove that the website itself is trustworthy or safe.
+
+## What the browser knows—and what it does not
+
+After successful validation, Chrome has evidence for a useful but bounded conclusion:
+
+```text
+The URL supplied the expected name.
+The certificate authorized a public key for that name.
+The authorization was currently valid and policy-compliant.
+The signed chain reached a locally trusted root.
+The live peer proved possession of the matching private key.
+```
+
+Chrome has not proved that:
+
+- The website's content is safe or truthful.
+- The domain owner is the person I had in mind.
+- The machine is the site's hidden origin rather than a CDN or reverse proxy.
+- A trusted CA could never make a mistake or be compromised.
+- A locally installed root could never be abused.
+
+That is why the precise phrase is not "Chrome knows this server is good." It is:
+
+> Chrome authenticated this peer as authorized to represent `yifanzhai.com` under Chrome's current certificate and trust policies.
+
+## The security checkpoint
+
+| Term | Explanation |
+| --- | --- |
+| Asset | The binding between `yifanzhai.com` and the key used by the live TLS peer |
+| Potential attacker | Someone who can redirect DNS or network traffic but does not possess an accepted certificate and private key for the name |
+| Trust boundary | The CA ecosystem, Chrome Root Store, local trust configuration, and the server's private-key boundary |
+| Desired property | Authentication of the server before trusting application traffic |
+| Failure mode | Chrome accepts an attacker-controlled endpoint as `yifanzhai.com` |
+
+## The answer created the next question
+
+The DNS lookup found an address. Certificate validation connected the expected name to the peer's public key and confirmed possession of the matching private key.
+
+```text
+URL hostname
+    |
+    v
+certificate name + public key
+    |
+    v
+signed path to a trusted root
+    |
+    v
+proof of private-key possession
+    |
+    v
+authenticated TLS peer
+```
+
+But a certificate does not explain how the bytes of an HTTP request become secret. In fact, modern HTTPS does not simply encrypt an entire web page with the certificate's public key.
+
+That leaves the next question:
+
+> Why does TLS need both asymmetric and symmetric cryptography, and how can the browser and server establish shared encryption keys while an attacker watches the network?
+
+## References
+
+- [Chromium: Certificate verification](https://chromium.googlesource.com/chromium/src/+/HEAD/net/cert/)
+- [Google Chrome Root Programs](https://www.chromium.org/Home/chromium-security/root-ca-policy/)
+- [Chrome DevTools: Privacy and security panel](https://developer.chrome.com/docs/devtools/security)
+- [IETF RFC 5280: PKIX certificate and path validation](https://datatracker.ietf.org/doc/html/rfc5280)
+- [IETF RFC 9525: Service Identity in TLS](https://datatracker.ietf.org/doc/html/rfc9525)
+- [IETF RFC 9846: TLS 1.3](https://datatracker.ietf.org/doc/html/rfc9846)
+- [Chromium: Certificate Transparency](https://chromium.googlesource.com/chromium/src/+/HEAD/net/docs/certificate-transparency.md)
+- [OpenSSL: `s_client`](https://docs.openssl.org/master/man1/openssl-s_client/)
+- [badssl.com test endpoints](https://badssl.com/)
