@@ -1,0 +1,410 @@
+---
+title: "How does TLS turn a trusted certificate into encrypted HTTP?"
+description: "Watching a real TLS 1.3 handshake to see how authentication, ephemeral key agreement, and symmetric encryption create a secure HTTPS connection."
+publishedAt: 2026-09-08
+tags: [tls, encryption, security]
+draft: false
+---
+
+The [certificate investigation](/writing/how-does-chrome-know-if-the-server-is-trustworthy/) ended with a trusted public key for `yifanzhai.com`.
+
+That solved one problem:
+
+> Chrome can authenticate the server.
+
+But it created another:
+
+> How do the browser and server turn that public key into an encrypted HTTP connection?
+
+A common assumption is that the browser creates a symmetric key, encrypts it with the certificate's public key, and sends it to the server.
+
+That picture describes an older TLS design. It is not how the modern TLS 1.3 connection I tested works.
+
+> 💡 **TLS — Transport Layer Security**
+>
+> [TLS](https://datatracker.ietf.org/doc/html/rfc9846) is the protocol that creates a secure channel between two endpoints. HTTPS is HTTP sent through that TLS channel. TLS aims to provide authentication, confidentiality, and integrity.
+
+So let's watch the real handshake.
+
+## TLS happens before HTTP
+
+From the terminal, I ran a direct request from macOS using curl. The OpenSSL experiments later in this article used OpenSSL 3.6.3. Server configuration and client preferences can change, so these results are just a one-time snapshot rather than permanent values.
+
+```bash
+curl --noproxy '*' --http1.1 -Iv --connect-timeout 15 \
+  https://yifanzhai.com/
+```
+
+Here is the useful part of the real output. I removed addresses, headers, byte counts, and connection identifiers that are not important to this question.
+
+```text
+TLS handshake, Client hello
+TLS handshake, Server hello
+TLS handshake, Certificate
+TLS handshake, CERT verify
+TLS handshake, Finished
+TLS handshake, Finished
+
+SSL connection using TLSv1.3 /
+  AEAD-CHACHA20-POLY1305-SHA256
+subjectAltName: host "yifanzhai.com" matched
+SSL certificate verify ok.
+
+> HEAD / HTTP/1.1
+< HTTP/1.1 200 OK
+```
+
+> 💡 **AEAD — Authenticated Encryption with Associated Data**
+>
+> AEAD protects confidentiality and integrity together. It encrypts content and creates an authentication tag. If an attacker changes a protected record, verification will fail instead of producing quietly modified HTTP. SHA means Secure Hash Algorithm; `SHA-256` in the output is a cryptographic hash used by the selected TLS key schedule.
+
+Curl still prints the historical phrase `SSL connection`. SSL means Secure Sockets Layer, the obsolete predecessor to TLS. The value that matters here is `TLSv1.3`: this connection did not negotiate old SSL.
+
+One layer is not visible in this curl excerpt: TCP. For HTTP/1.1 and HTTP/2, curl first establishes a TCP connection, then performs the TLS handshake over that connection. Curl's verbose output focuses on TLS and HTTP, so it normally does not show the TCP SYN / SYN-ACK / ACK exchange.
+
+The sequence looks like this:
+
+```text
+DNS lookup
+    ↓
+TCP connection
+    ↓
+TLS handshake
+    |
+    | authenticate the server
+    | establish traffic keys
+    | check that the handshake was not changed
+    ↓
+secure TLS channel
+    ↓
+HTTP request and response
+```
+
+The HTTP request was sent only after the TCP connection existed and the TLS handshake had successfully established a secure channel.
+
+## TLS uses two kinds of cryptography
+
+HTTPS is often described as using “public-key encryption,” but that description leaves out important parts of how TLS actually works.
+
+Modern TLS uses asymmetric and symmetric cryptography for different jobs.
+
+> 💡 **Asymmetric cryptography**
+>
+> Asymmetric systems use a public key and private key. In this TLS 1.3 handshake, signatures authenticate the server, while **ephemeral** key pairs help establish shared secrets. The certificate’s public key is not used to encrypt the web page itself.
+
+> 💡 **Symmetric cryptography**
+>
+> Symmetric systems protect data with secret key material known to both endpoints. They are fast enough for HTTP bodies, images, videos, and long-lived connections. TLS derives separate keys for each direction instead of using one key for everything.
+
+The division of work looks like this; the sections below unpack each part:
+
+| Job | Tool |
+| --- | --- |
+| Authenticate the server | Certificate and digital signature |
+| Establish shared secret material | Ephemeral asymmetric key agreement (usually ECDHE) |
+| Derive traffic secrets and keys | HMAC-based Key Derivation Function (HKDF) |
+| Protect HTTP traffic | Symmetric authenticated encryption |
+
+Asymmetric cryptography gets the secure conversation started. Symmetric cryptography does the bulk work after that.
+
+## Watching the TLS 1.3 messages
+
+Curl gave me a summary. OpenSSL can show the handshake messages more clearly:
+
+```bash
+openssl s_client \
+  -connect yifanzhai.com:443 \
+  -servername yifanzhai.com \
+  -tls1_3 \
+  -groups X25519 \
+  -verify_hostname yifanzhai.com \
+  -verify_return_error \
+  -msg -brief </dev/null
+```
+
+I selected `X25519` to keep this experiment focused on one common key-agreement method. The command still verifies the real hostname and certificate.
+
+Before looking at the result, try to predict the order. Does the certificate come before or after the server chooses the TLS parameters?
+
+Here is the relevant portion of the actual output:
+
+```text
+>>> ClientHello
+<<< ServerHello
+<<< EncryptedExtensions
+<<< Certificate
+<<< CertificateVerify
+<<< Finished
+>>> Finished
+
+CONNECTION ESTABLISHED
+Protocol version: TLSv1.3
+Ciphersuite: TLS_AES_256_GCM_SHA384
+Peer certificate: CN=yifanzhai.com
+Verification: OK
+Verified peername: yifanzhai.com
+```
+
+`CN` means Common Name. The [certificate article](/writing/how-does-chrome-know-if-the-server-is-trustworthy/) explained why the actual hostname check uses the certificate's Subject Alternative Name.
+
+Now we can walk through the story without decoding every byte.
+
+## Step 1: exchange public key shares
+
+The `ClientHello` says what the client supports. It also carries the client's temporary public key share.
+
+The `ServerHello` selects TLS 1.3 and returns the server's temporary public key share.
+
+> 💡 **ECDHE — Ephemeral Elliptic Curve Diffie–Hellman**
+>
+> ECDHE is a key agreement method. Each side creates a temporary private value and sends only its public share. [`X25519`](https://datatracker.ietf.org/doc/html/rfc7748) is the elliptic-curve function used in this experiment. "Ephemeral" means the temporary private values are created for the connection and should later be discarded.
+
+Conceptually, both sides perform matching calculations:
+
+```text
+client private value + server public share
+                    -> shared secret
+
+server private value + client public share
+                    -> the same shared secret
+```
+
+The `+` above means "combine through the key-agreement algorithm," not normal addition.
+
+What crosses the network:
+
+```text
+client public share  --->
+                       <---  server public share
+```
+
+What stays private:
+
+```text
+client private value       server private value
+```
+
+The shared secret is not sent across the network. Both endpoints derive it independently. Someone recording only the public shares should not be able to calculate it.
+
+That is a much better interview answer than "the server sends the symmetric key."
+
+## Step 2: authenticate the key exchange
+
+Key agreement alone is not enough.
+
+> 💡 **Handshake transcript**
+>
+> The handshake transcript is the ordered record of the handshake messages both sides have seen. TLS signs and checks hashes of this transcript so an attacker cannot quietly change the negotiation.
+
+An active attacker could try to establish one secret with the client and a different secret with the real server. The attacker would sit in the middle and relay messages.
+
+This is where the certificate article connects back in:
+
+```text
+Certificate
+    supplies the public key authorized for yifanzhai.com
+
+CertificateVerify
+    signs this handshake with the matching private key
+```
+
+The signature covers the handshake transcript, including the key-agreement messages. The browser therefore checks more than "this is a valid certificate." It checks that the holder of that certificate participated in this exact handshake.
+
+If an attacker changes a key share or negotiation parameter, the transcript changes and the signature verification fails.
+
+## Step 3: turn one secret into several keys
+
+The shared secret is raw material. TLS should not reuse that exact value directly for every purpose.
+
+> 💡 **HKDF — HMAC-based Extract-and-Expand Key Derivation Function**
+>
+> [HKDF](https://datatracker.ietf.org/doc/html/rfc5869) turns secret input into multiple cryptographically separated outputs. `HMAC` means Hash-based Message Authentication Code; it combines a secret key with a hash. TLS uses HKDF like a key factory: handshake keys, client traffic keys, server traffic keys, and related values come from the handshake without all becoming the same key.
+
+The simplified flow is:
+
+```text
+ephemeral shared secret
+        +
+handshake transcript
+        |
+        v
+      HKDF
+        |
+        +--> client-to-server traffic key
+        +--> server-to-client traffic key
+        +--> client-to-server IV (initialization vector used to construct record nonces)
+        +--> server-to-client IV (initialization vector used to construct record nonces)
+```
+
+This separation matters. A key used in one direction or for one purpose should not silently become every other key in the connection.
+
+## Step 4: prove both sides saw the same handshake
+
+Each side sends a `Finished` message calculated from its handshake secret and the transcript so far.
+
+The other side calculates the expected value. If the values differ, something went wrong: the peers derived different secrets, or a handshake message was changed.
+
+```text
+server Finished  -> client verifies
+client Finished  -> server verifies
+```
+
+After the checks succeed, both sides can move to application traffic.
+
+> 🎤 **Interview checkpoint**
+>
+> `CertificateVerify` proves possession of the certificate's private key and binds the server to the handshake. `Finished` confirms the handshake transcript and the derived secrets. They are related checks, but they are not the same message.
+
+## Step 5: protect HTTP with AEAD
+
+The OpenSSL result selected:
+
+```text
+TLS_AES_256_GCM_SHA384
+```
+
+The curl client selected a different valid option:
+
+```text
+AEAD-CHACHA20-POLY1305-SHA256
+```
+
+Different clients can prefer different algorithms while following the same TLS 1.3 design.
+
+[`AEAD`](https://datatracker.ietf.org/doc/html/rfc5116) was introduced in the first experiment. In the cipher names, AES means Advanced Encryption Standard and GCM means Galois/Counter Mode. ChaCha20-Poly1305 is another AEAD design.
+
+> 💡 **TLS 1.3 cipher suite**
+>
+> A cipher suite is a named set of cryptographic choices. In `TLS_AES_256_GCM_SHA384`, `AES_256_GCM` is the record-protection algorithm and `SHA384` is the hash used by the TLS key schedule. TLS 1.3 negotiates key agreement and certificate signatures separately, so X25519 does not appear in this name.
+
+TLS divides application traffic into records and protects each record with direction-specific symmetric keys.
+
+```text
+HTTP request at the client
+    |
+    v
+TLS record + AEAD encryption
+    |
+    v
+ciphertext on the network
+    |
+    v
+TLS record + AEAD verification/decryption
+    |
+    v
+HTTP request at the server
+```
+
+The server performs the same process in the other direction for the response.
+
+Encryption alone would not be enough. An attacker might not understand the ciphertext but could still try to alter it. AEAD lets the receiver detect that tampering.
+
+## The old textbook model
+
+Older TLS could use static RSA key transport:
+
+> 💡 **RSA**
+>
+> RSA is a public-key algorithm named after Rivest, Shamir, and Adleman. In older TLS key transport, the certificate's RSA public key encrypted secret material that only the long-term RSA private key could decrypt.
+
+```text
+client creates secret input
+        |
+        | encrypt with server's long-term RSA public key
+        v
+server decrypts with its long-term RSA private key
+        |
+        v
+both derive symmetric traffic keys
+```
+
+In this older design, the certificate's RSA key was used directly for key transport.
+
+The [`static-rsa.badssl.com`](https://static-rsa.badssl.com/) endpoint exists to demonstrate this older configuration. I connected to it with TLS 1.2:
+
+```bash
+openssl s_client \
+  -connect static-rsa.badssl.com:443 \
+  -servername static-rsa.badssl.com \
+  -tls1_2 \
+  -verify_hostname static-rsa.badssl.com \
+  -verify_return_error -brief </dev/null
+```
+
+The real result included:
+
+```text
+CONNECTION ESTABLISHED
+Protocol version: TLSv1.2
+Ciphersuite: AES256-GCM-SHA384
+Verification: OK
+```
+
+The teaching endpoint is deliberately constrained to the older static-RSA setup. When I forced TLS 1.3 against it, the handshake failed:
+
+```text
+SSL alert number 40
+TLS alert handshake failure
+```
+
+[TLS 1.3 removed static RSA key exchange](https://datatracker.ietf.org/doc/html/rfc9846#section-1.3). This does not mean RSA signatures disappeared. It means the long-term RSA certificate key is no longer used to decrypt a transported session secret in TLS 1.3.
+
+Why remove the old design? Imagine that an attacker records encrypted connections today and steals the server's long-term RSA private key next year. With static RSA key transport, that key could expose the recorded secret input and allow old sessions to be decrypted.
+
+The certificate-based TLS 1.3 handshake tested above used fresh X25519 private values instead.
+
+> 💡 **Forward secrecy**
+>
+> Forward secrecy limits the damage from a future long-term key compromise. If ephemeral private values were fresh and destroyed, stealing the certificate's private key later should not reveal the traffic keys from earlier recorded connections.
+
+Forward secrecy does not protect an endpoint that is already compromised during the session. It also does not make stolen current traffic keys harmless. It answers a narrower question: does losing a long-term key later unlock old captured traffic?
+
+## Five common interview traps
+
+### "TLS encrypts HTTP with the certificate's public key"
+
+Not in modern TLS 1.3. The certificate key authenticates the handshake. Symmetric AEAD keys protect the HTTP traffic.
+
+### "The symmetric session key is sent to the server"
+
+Not in the ephemeral handshake we observed. Public shares are sent; both sides derive shared secret material and then derive traffic keys.
+
+### "ECDHE authenticates the server"
+
+ECDHE establishes a secret but does not identify the peer by itself. The certificate and handshake signature authenticate the exchange.
+
+### "Both directions use one identical key"
+
+TLS derives separate key material for client-to-server and server-to-client traffic.
+
+### "HTTPS only provides encryption"
+
+TLS aims to provide authentication, confidentiality, and integrity. Losing any one of those properties creates a different security problem.
+
+## The interview-sized answer
+
+If an interviewer asks how a modern HTTPS connection is established, this is a useful answer:
+
+> The client sends a `ClientHello` with supported parameters and an ephemeral key share. The server replies with its own key share, and both sides independently derive shared secret material. The server sends its certificate and signs the handshake with the corresponding private key, binding its authenticated identity to this key exchange. Both sides derive separate traffic keys and verify the handshake with `Finished` messages. HTTP is then protected with fast symmetric AEAD encryption. Because the key agreement used fresh ephemeral values, later compromise of the certificate's private key should not decrypt earlier recorded sessions.
+
+That is enough for many security interviews. The exact curve calculations, HKDF labels, record bytes, session resumption, and early-data behavior can wait until a question actually needs them.
+
+## The answer created the next question
+
+The browser now has an authenticated, encrypted channel to the origin named in the URL. It can send application data, such as a password, without exposing it to passive network observers.
+
+But TLS does not create application login state. The existing TCP/TLS connection may be reused for multiple HTTP requests, or it may close and a later request may use a new connection. Either way, the user should not have to type the password again on every page.
+
+> After login succeeds, how does a website remember that this browser is still authenticated?
+
+That is where session identifiers, cookies, and tokens enter the story.
+
+## References and hands-on learning
+
+- [IETF RFC 9846: TLS 1.3](https://datatracker.ietf.org/doc/html/rfc9846)
+- [IETF RFC 7748: X25519 and X448](https://datatracker.ietf.org/doc/html/rfc7748)
+- [IETF RFC 5869: HKDF](https://datatracker.ietf.org/doc/html/rfc5869)
+- [IETF RFC 5116: AEAD](https://datatracker.ietf.org/doc/html/rfc5116)
+- [OpenSSL: `s_client`](https://docs.openssl.org/master/man1/openssl-s_client/)
+- [badssl.com TLS test endpoints](https://badssl.com/)
+- [The Illustrated TLS 1.3 Connection](https://tls13.xargs.org/)
