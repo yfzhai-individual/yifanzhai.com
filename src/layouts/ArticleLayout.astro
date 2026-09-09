@@ -30,12 +30,87 @@ const tocHeadings = headings.filter((heading) => heading.depth === 2 || heading.
     <div class="section prose-wrap">
       <div class="prose"><slot /></div>
       {tocHeadings.length > 0 && (
-        <nav class="toc" aria-label="Table of contents">
-          <p>On this page</p>
-          <ol>{tocHeadings.map((heading) => <li style={heading.depth === 3 ? 'padding-left: .8rem' : undefined}><a href={`#${heading.slug}`}>{heading.text}</a></li>)}</ol>
-        </nav>
+        <aside class="article-rail">
+          <div class="reading-progress">
+            <div><span>Reading progress</span><output id="reading-progress-value">0%</output></div>
+            <progress id="reading-progress" max="100" value="0" aria-label="Reading progress">0%</progress>
+          </div>
+          <nav class="toc" aria-label="Table of contents">
+            <button class="toc-toggle" type="button" aria-expanded="false" aria-controls="toc-list">
+              <span>On this page</span><span aria-hidden="true">+</span>
+            </button>
+            <p class="toc-label">On this page</p>
+            <ol id="toc-list">{tocHeadings.map((heading) => <li class:list={{ 'toc-depth-3': heading.depth === 3 }}><a href={`#${heading.slug}`}>{heading.text}</a></li>)}</ol>
+          </nav>
+        </aside>
       )}
     </div>
     <p style="padding-block: 2rem 5rem"><a class="text-link" href={backHref}>Back to {backLabel}</a></p>
   </article>
 </BaseLayout>
+
+<script>
+  const article = document.querySelector<HTMLElement>('.prose');
+  const progress = document.querySelector<HTMLProgressElement>('#reading-progress');
+  const progressValue = document.querySelector<HTMLOutputElement>('#reading-progress-value');
+  const articleRail = document.querySelector<HTMLElement>('.article-rail');
+  const toc = document.querySelector<HTMLElement>('.toc');
+  const tocToggle = document.querySelector<HTMLButtonElement>('.toc-toggle');
+  const tocLinks = [...document.querySelectorAll<HTMLAnchorElement>('.toc a[href^="#"]')];
+  const sections = tocLinks
+    .map((link) => document.getElementById(decodeURIComponent(link.hash.slice(1))))
+    .filter((section): section is HTMLElement => Boolean(section));
+
+  const updateArticleRail = () => {
+    if (!article || !progress || !progressValue) return;
+
+    const start = article.getBoundingClientRect().top + window.scrollY;
+    const end = start + article.offsetHeight - window.innerHeight;
+    const percent = end <= start ? 100 : Math.min(100, Math.max(0, ((window.scrollY - start) / (end - start)) * 100));
+    const rounded = Math.round(percent);
+    progress.value = rounded;
+    progress.textContent = `${rounded}%`;
+    progressValue.value = `${rounded}%`;
+
+    let activeSection = sections[0];
+    for (const section of sections) {
+      if (section.getBoundingClientRect().top <= 120) activeSection = section;
+      else break;
+    }
+
+    for (const link of tocLinks) {
+      const isActive = activeSection && link.hash === `#${activeSection.id}`;
+      if (isActive) link.setAttribute('aria-current', 'location');
+      else link.removeAttribute('aria-current');
+    }
+
+    const activeLink = tocLinks.find((link) => link.hasAttribute('aria-current'));
+    if (activeLink && articleRail && window.matchMedia('(min-width: 48.001rem)').matches) {
+      const linkTop = activeLink.offsetTop;
+      const linkBottom = linkTop + activeLink.offsetHeight;
+      if (linkTop < articleRail.scrollTop + 48) articleRail.scrollTop = Math.max(0, linkTop - 48);
+      else if (linkBottom > articleRail.scrollTop + articleRail.clientHeight - 24) articleRail.scrollTop = linkBottom - articleRail.clientHeight + 24;
+    }
+  };
+
+  let frame = 0;
+  const scheduleUpdate = () => {
+    if (frame) return;
+    frame = window.requestAnimationFrame(() => {
+      updateArticleRail();
+      frame = 0;
+    });
+  };
+
+  tocToggle?.addEventListener('click', () => {
+    const isOpen = toc?.dataset.open === 'true';
+    if (toc) toc.dataset.open = String(!isOpen);
+    tocToggle.setAttribute('aria-expanded', String(!isOpen));
+    const indicator = tocToggle.lastElementChild;
+    if (indicator) indicator.textContent = isOpen ? '+' : '−';
+  });
+
+  window.addEventListener('scroll', scheduleUpdate, { passive: true });
+  window.addEventListener('resize', scheduleUpdate);
+  updateArticleRail();
+</script>

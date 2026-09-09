@@ -6,6 +6,8 @@ tags: [tls, encryption, security]
 draft: false
 ---
 
+import Callout from '../../components/Callout.astro';
+
 The [certificate investigation](/writing/how-does-chrome-know-if-the-server-is-trustworthy/) ended with a trusted public key for `yifanzhai.com`.
 
 That solved one problem:
@@ -20,9 +22,9 @@ A common assumption is that the browser creates a symmetric key, encrypts it wit
 
 That picture describes an older TLS design. It is not how the modern TLS 1.3 connection I tested works.
 
-> 💡 **TLS — Transport Layer Security**
->
-> [TLS](https://datatracker.ietf.org/doc/html/rfc9846) is the protocol that creates a secure channel between two endpoints. HTTPS is HTTP sent through that TLS channel. TLS aims to provide authentication, confidentiality, and integrity.
+<Callout type="info" title="TLS — Transport Layer Security">
+[TLS](https://datatracker.ietf.org/doc/html/rfc9846) is the protocol that creates a secure channel between two endpoints. HTTPS is HTTP sent through that TLS channel. TLS aims to provide authentication, confidentiality, and integrity.
+</Callout>
 
 So let's watch the real handshake.
 
@@ -54,9 +56,9 @@ SSL certificate verify ok.
 < HTTP/1.1 200 OK
 ```
 
-> 💡 **AEAD — Authenticated Encryption with Associated Data**
->
-> AEAD protects confidentiality and integrity together. It encrypts content and creates an authentication tag. If an attacker changes a protected record, verification will fail instead of producing quietly modified HTTP. SHA means Secure Hash Algorithm; `SHA-256` in the output is a cryptographic hash used by the selected TLS key schedule.
+<Callout type="info" title="AEAD — Authenticated Encryption with Associated Data">
+AEAD protects confidentiality and integrity together. It encrypts content and creates an authentication tag. If an attacker changes a protected record, verification will fail instead of producing quietly modified HTTP. SHA means Secure Hash Algorithm; `SHA-256` in the output is a cryptographic hash used by the selected TLS key schedule.
+</Callout>
 
 Curl still prints the historical phrase `SSL connection`. SSL means Secure Sockets Layer, the obsolete predecessor to TLS. The value that matters here is `TLSv1.3`: this connection did not negotiate old SSL.
 
@@ -88,13 +90,13 @@ HTTPS is often described as using “public-key encryption,” but that descript
 
 Modern TLS uses asymmetric and symmetric cryptography for different jobs.
 
-> 💡 **Asymmetric cryptography**
->
-> Asymmetric systems use a public key and private key. In this TLS 1.3 handshake, signatures authenticate the server, while **ephemeral** key pairs help establish shared secrets. The certificate’s public key is not used to encrypt the web page itself.
+<Callout type="info" title="Asymmetric cryptography">
+Asymmetric systems use a public key and private key. In this TLS 1.3 handshake, signatures authenticate the server, while **ephemeral** key pairs help establish shared secrets. The certificate’s public key is not used to encrypt the web page itself.
+</Callout>
 
-> 💡 **Symmetric cryptography**
->
-> Symmetric systems protect data with secret key material known to both endpoints. They are fast enough for HTTP bodies, images, videos, and long-lived connections. TLS derives separate keys for each direction instead of using one key for everything.
+<Callout type="info" title="Symmetric cryptography">
+Symmetric systems protect data with secret key material known to both endpoints. They are fast enough for HTTP bodies, images, videos, and long-lived connections. TLS derives separate keys for each direction instead of using one key for everything.
+</Callout>
 
 The division of work looks like this; the sections below unpack each part:
 
@@ -155,9 +157,9 @@ The `ClientHello` says what the client supports. It also carries the client's te
 
 The `ServerHello` selects TLS 1.3 and returns the server's temporary public key share.
 
-> 💡 **ECDHE — Ephemeral Elliptic Curve Diffie–Hellman**
->
-> ECDHE is a key agreement method. Each side creates a temporary private value and sends only its public share. [`X25519`](https://datatracker.ietf.org/doc/html/rfc7748) is the elliptic-curve function used in this experiment. "Ephemeral" means the temporary private values are created for the connection and should later be discarded.
+<Callout type="info" title="ECDHE — Ephemeral Elliptic Curve Diffie–Hellman">
+ECDHE is a key agreement method. Each side creates a temporary private value and sends only its public share. [`X25519`](https://datatracker.ietf.org/doc/html/rfc7748) is the elliptic-curve function used in this experiment. "Ephemeral" means the temporary private values are created for the connection and should later be discarded.
+</Callout>
 
 Conceptually, both sides perform matching calculations:
 
@@ -192,9 +194,9 @@ That is a much better interview answer than "the server sends the symmetric key.
 
 Key agreement alone is not enough.
 
-> 💡 **Handshake transcript**
->
-> The handshake transcript is the ordered record of the handshake messages both sides have seen. TLS signs and checks hashes of this transcript so an attacker cannot quietly change the negotiation.
+<Callout type="info" title="Handshake transcript">
+The handshake transcript is the ordered record of the handshake messages both sides have seen. TLS signs and checks hashes of this transcript so an attacker cannot quietly change the negotiation.
+</Callout>
 
 An active attacker could try to establish one secret with the client and a different secret with the real server. The attacker would sit in the middle and relay messages.
 
@@ -216,9 +218,9 @@ If an attacker changes a key share or negotiation parameter, the transcript chan
 
 The shared secret is raw material. TLS should not reuse that exact value directly for every purpose.
 
-> 💡 **HKDF — HMAC-based Extract-and-Expand Key Derivation Function**
->
-> [HKDF](https://datatracker.ietf.org/doc/html/rfc5869) turns secret input into multiple cryptographically separated outputs. `HMAC` means Hash-based Message Authentication Code; it combines a secret key with a hash. TLS uses HKDF like a key factory: handshake keys, client traffic keys, server traffic keys, and related values come from the handshake without all becoming the same key.
+<Callout type="info" title="HKDF — HMAC-based Extract-and-Expand Key Derivation Function">
+[HKDF](https://datatracker.ietf.org/doc/html/rfc5869) turns secret input into multiple cryptographically separated outputs. `HMAC` means Hash-based Message Authentication Code; it combines a secret key with a hash. TLS uses HKDF like a key factory: handshake keys, client traffic keys, server traffic keys, and related values come from the handshake without all becoming the same key.
+</Callout>
 
 The simplified flow is:
 
@@ -251,9 +253,9 @@ client Finished  -> server verifies
 
 After the checks succeed, both sides can move to application traffic.
 
-> 🎤 **Interview checkpoint**
->
-> `CertificateVerify` proves possession of the certificate's private key and binds the server to the handshake. `Finished` confirms the handshake transcript and the derived secrets. They are related checks, but they are not the same message.
+<Callout type="interview" title="Interview checkpoint">
+`CertificateVerify` proves possession of the certificate's private key and binds the server to the handshake. `Finished` confirms the handshake transcript and the derived secrets. They are related checks, but they are not the same message.
+</Callout>
 
 ## Step 5: protect HTTP with AEAD
 
@@ -273,9 +275,9 @@ Different clients can prefer different algorithms while following the same TLS 1
 
 [`AEAD`](https://datatracker.ietf.org/doc/html/rfc5116) was introduced in the first experiment. In the cipher names, AES means Advanced Encryption Standard and GCM means Galois/Counter Mode. ChaCha20-Poly1305 is another AEAD design.
 
-> 💡 **TLS 1.3 cipher suite**
->
-> A cipher suite is a named set of cryptographic choices. In `TLS_AES_256_GCM_SHA384`, `AES_256_GCM` is the record-protection algorithm and `SHA384` is the hash used by the TLS key schedule. TLS 1.3 negotiates key agreement and certificate signatures separately, so X25519 does not appear in this name.
+<Callout type="info" title="TLS 1.3 cipher suite">
+A cipher suite is a named set of cryptographic choices. In `TLS_AES_256_GCM_SHA384`, `AES_256_GCM` is the record-protection algorithm and `SHA384` is the hash used by the TLS key schedule. TLS 1.3 negotiates key agreement and certificate signatures separately, so X25519 does not appear in this name.
+</Callout>
 
 TLS divides application traffic into records and protects each record with direction-specific symmetric keys.
 
@@ -303,9 +305,9 @@ Encryption alone would not be enough. An attacker might not understand the ciphe
 
 Older TLS could use static RSA key transport:
 
-> 💡 **RSA**
->
-> RSA is a public-key algorithm named after Rivest, Shamir, and Adleman. In older TLS key transport, the certificate's RSA public key encrypted secret material that only the long-term RSA private key could decrypt.
+<Callout type="info" title="RSA">
+RSA is a public-key algorithm named after Rivest, Shamir, and Adleman. In older TLS key transport, the certificate's RSA public key encrypted secret material that only the long-term RSA private key could decrypt.
+</Callout>
 
 ```text
 client creates secret input
@@ -353,11 +355,13 @@ Why remove the old design? Imagine that an attacker records encrypted connection
 
 The certificate-based TLS 1.3 handshake tested above used fresh X25519 private values instead.
 
-> 💡 **Forward secrecy**
->
-> Forward secrecy limits the damage from a future long-term key compromise. If ephemeral private values were fresh and destroyed, stealing the certificate's private key later should not reveal the traffic keys from earlier recorded connections.
+<Callout type="info" title="Forward secrecy">
+Forward secrecy limits the damage from a future long-term key compromise. If ephemeral private values were fresh and destroyed, stealing the certificate's private key later should not reveal the traffic keys from earlier recorded connections.
+</Callout>
 
+<Callout type="warning" title="Limits of forward secrecy">
 Forward secrecy does not protect an endpoint that is already compromised during the session. It also does not make stolen current traffic keys harmless. It answers a narrower question: does losing a long-term key later unlock old captured traffic?
+</Callout>
 
 ## Five common interview traps
 

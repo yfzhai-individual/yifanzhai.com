@@ -1,0 +1,30 @@
+---
+interface Props {
+  type?: 'info' | 'warning' | 'interview';
+  title?: string;
+}
+
+const { type = 'info', title } = Astro.props;
+const labels = {
+  info: 'Good to know',
+  warning: 'Watch out',
+  interview: 'Interview checkpoint',
+};
+const label = title ?? labels[type];
+---
+
+<aside class={`callout callout-${type}`} aria-label={label}>
+  <div class="callout-heading">
+    <span class="callout-icon" aria-hidden="true">
+      {type === 'warning' ? (
+        <svg viewBox="0 0 24 24"><path d="M12 3 2.8 20h18.4L12 3Z"/><path d="M12 9v5m0 3v.01"/></svg>
+      ) : type === 'interview' ? (
+        <svg viewBox="0 0 24 24"><path d="M5 5h14v10H9l-4 4V5Z"/><path d="M9 9h6m-6 3h4"/></svg>
+      ) : (
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10v.01"/></svg>
+      )}
+    </span>
+    <strong>{label}</strong>
+  </div>
+  <div class="callout-body"><slot /></div>
+</aside>

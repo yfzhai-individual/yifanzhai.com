@@ -6,6 +6,8 @@ tags: [software]
 draft: true
 ---
 
+import Callout from '../../components/Callout.astro';
+
 ## First section
 
 Start writing here. Change `draft` to `false` when the post is ready.
@@ -13,6 +15,14 @@ Start writing here. Change `draft` to `false` when the post is ready.
 ```ts
 const example = 'Syntax highlighting is ready.';
 ```
+
+<Callout type="info" title="Useful context">
+Use an information callout for context that materially helps the reader but should not interrupt the main explanation.
+</Callout>
+
+<Callout type="warning" title="Important limitation">
+Use a warning callout for a pitfall, unsafe assumption, or important boundary.
+</Callout>
 
 ## Another section
 
