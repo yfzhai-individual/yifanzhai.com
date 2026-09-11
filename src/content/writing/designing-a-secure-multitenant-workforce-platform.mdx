@@ -1,0 +1,725 @@
+---
+title: "Designing a Secure Multitenant Workforce Platform"
+description: "A practical system design case study for shared HR, time-off, payroll, and document services, covering tenant isolation, authorization, Kubernetes, audit logs, and emergency access."
+publishedAt: 2026-09-10
+tags: [security, system design, SaaS, case study]
+draft: false
+---
+
+import SecurityArchitectureFlow from '../../components/SecurityArchitectureFlow.astro';
+import ServiceArchitectureDiagram from '../../components/ServiceArchitectureDiagram.astro';
+import Callout from '../../components/Callout.astro';
+import { secureSaasArchitecture } from '../../data/architecture-diagrams';
+
+Today, we will design the security architecture for a fictional workforce platform. A small business may use only employee records and time-off management. A larger company may add payroll, document management, enterprise SSO, integrations, and custom approval flows. Every company uses the same product platform, but one company must never be able to read or change another company's data.
+
+We will build the design in the same order we could present it during a 30–45 minute system design interview. First, we will define the requirements, data records, and APIs. Next, we will draw the login path, one sensitive employee-data request, and one document upload. Finally, we will examine the security decisions in more detail.
+
+The main goal is to make sure every operation keeps four facts together: the verified user, the company they are working in, the action they requested, and the employee or payroll resource they want to use. Losing any one of these facts at an API, service, queue, cache, or database boundary can expose another company's data.
+
+This is a **Rippling-like product model**, not a description of Rippling's private architecture. Rippling has publicly described a [hub-and-spoke backend](https://www.rippling.com/blog/how-a-team-of-only-10-engineers-built-ripplings-peo-from-scratch), with company and user information in the hub and products such as payroll and benefits around it. It also describes [permissions that depend on employee attributes and relationships](https://www.rippling.com/blog/introducing-role-based-permissions-get-complete-control-over-the-data-and-apps-that-your-team-can-manage). Those ideas are useful for our fictional system. [Workday describes a shared multitenant platform](https://www.workday.com/en-us/legal/universal-contract-terms-and-conditions/umsa/faq.html), while [ServiceNow documents a contrasting multi-instance model](https://www.servicenow.com/standard/resource-center/ebook/ebk-how-servicenow-delivers-safe-and-secure-cloud-services.html) with a dedicated database for each customer instance.
+
+<Callout type="info" title="What is shared, and what must stay separate">
+The companies share application code, service replicas, and—in the default tier—database tables. They do not share authority. In this article, each company is a **tenant**. Every customer-owned record has one tenant, and every request is limited to one active tenant. A person may belong to several companies, but the membership and worker records for each company stay separate.
+</Callout>
+
+Sharing a service does not require giving every customer every feature. A **module entitlement** says whether a company has purchased or enabled HR, time off, or payroll. User authorization is a separate decision: it says who inside that company may use the enabled module and which employee records they may see.
+
+<Callout type="info" title="Product entitlement is not user permission">
+A product entitlement enables a feature for a company. A permission allows one user to perform one action on particular data. A company may subscribe to payroll while only its payroll administrators can run payroll or read tax details.
+</Callout>
+
+The interview structure follows [HelloInterview's delivery framework](https://www.hellointerview.com/learn/system-design/in-a-hurry/delivery). We will first produce a complete working design, then spend most of the remaining time on the hardest security decisions.
+
+## The interview prompt
+
+> Design the security architecture for a multitenant workforce management platform.
+>
+> Companies can enable core HR, time off, payroll, and employee document modules. Employees can view their own records. Managers can act for their teams. HR and payroll administrators can manage sensitive fields and approval flows. A person may belong to several companies and must be able to switch between them. Large customers can use their own identity provider. The product also exposes APIs and needs controlled support access.
+
+Assume 10,000 companies, one million user identities, several million worker records, and hundreds of millions of time entries, payroll items, and documents. Most documents are below 25 MB.
+
+At this scale, we can begin with shared stateless services and shared PostgreSQL tables. The services run in containers managed by Kubernetes. A service replica may handle requests for many companies, so it must keep tenant context inside each request rather than in shared process state. Clients can upload files directly to object storage, and workers can scan those files in the background. As the platform grows, we also need a way to place groups of tenants into separate deployment cells so one failure does not affect everyone.
+
+<Callout type="info" title="A deployment cell limits the impact of failure">
+A deployment cell is one copy of the application and its supporting data systems that serves only part of the customer base. If a cell fails or is compromised, tenants in other cells can remain isolated and available.
+</Callout>
+
+## A 45-minute delivery framework
+
+| Time | Stage | What to produce |
+|---|---|---|
+| 0 to 5 min | Scope and requirements | Actors, sensitive actions, security goals, and exclusions |
+| 5 to 8 min | Entities and rules | The core records and rules that must always hold |
+| 8 to 12 min | Interfaces | APIs that force identity, tenant, resource, and upload decisions |
+| 12 to 25 min | Main design | One request path, one upload path, and the trust boundaries |
+| 25 to 42 min | Detailed review | Authorization and tenant isolation first, then uploads, audit, or support access |
+| 42 to 45 min | Failure review | Main attack paths, tradeoffs, and the next hardening step |
+
+Show that the whole system works, but reserve about half the interview for two or three hard security problems.
+
+## 1. Requirements
+
+### Core functional requirements
+
+1. A user can authenticate and work within one active company at a time.
+2. A company can enable HR, time-off, payroll, and document modules from the same platform.
+3. Employees can view allowed parts of their own profile, payslips, time-off requests, and documents.
+4. Managers, HR partners, and payroll administrators can act only within their role and organizational scope.
+5. Payroll changes and other high-risk actions can require one or more approvals.
+6. Companies can integrate through scoped APIs, webhooks, SSO, and user provisioning.
+7. Support personnel can request temporary access through an approval workflow.
+
+### Security and operational requirements
+
+1. **No access across tenants.** A valid login is not enough. Every data operation must use the active tenant and check the target resource.
+2. **Deny by default.** New routes, resource types, and actions are inaccessible until a policy explicitly permits them.
+3. **Fast revocation.** Terminating employment, changing a manager, or removing a payroll administrator should take effect quickly even when an access token has not expired.
+4. **Field-level protection.** Permission to view an employee's name does not automatically include compensation, tax, bank, health, or performance data.
+5. **Safe file handling.** The system does not parse or serve an uploaded tax form, identity document, or attachment until validation and scanning finish.
+6. **Useful audit logs.** We can reconstruct sensitive reads, payroll changes, exports, permission changes, and support access without logging secrets or document contents.
+7. **Complete data lifecycle.** Retention and deletion cover the database, object versions, search indexes, derived files, logs, and backups.
+8. **Limit the impact of one failure.** A software bug, compromised workload, abusive tenant, or malicious document should not expose the entire platform.
+
+Security-sensitive paths fail closed: when the system cannot confirm that an action is allowed, it rejects the action. Short-lived cached decisions and durable queues can keep some work available during an outage, but an outage must never bypass authorization or audit controls.
+
+<Callout type="info" title="Deny by default and fail closed">
+**Deny by default** means that an action is blocked until a rule allows it. **Fail closed** means that a broken or unavailable security check results in a denial, not automatic access.
+</Callout>
+
+### Out of scope for the first pass
+
+- Product UI and report formatting
+- Billing and subscription management
+- Country-specific tax calculations and the banking rails that move payroll funds
+- Building an identity provider, antivirus engine, database, or cryptographic service from scratch
+- Active/active data consistency across regions
+
+These limits keep the interview focused on the security design.
+
+## 2. Core entities and invariants
+
+Start with the records the system must store. These names will appear throughout the rest of the design:
+
+- **Principal:** a human user or workload identity.
+- **Tenant:** a customer company and its isolation boundary.
+- **Membership:** the relationship between a principal and a tenant, including role, status, identity connection, and authorization version.
+- **WorkerProfile:** one employment record owned by one tenant. The same person can have unrelated worker profiles in different tenants.
+- **OrgRelationship:** a tuple such as `worker:123 reports_to worker:456` or `principal:789 is_hr_partner_for department:10`.
+- **ModuleEntitlement:** whether a tenant can use HR, time off, payroll, or another product module.
+- **TimeOffRequest:** a request tied to one worker, policy, approval chain, and tenant.
+- **PayrollRun:** one tenant's pay-period calculation and approval state. Individual payroll items also carry the tenant ID.
+- **Document:** metadata for one immutable object version, including its tenant, worker, category, checksum, scan state, and retention class.
+- **Integration:** a machine principal, scopes, tenant binding, credentials, and rotation state.
+- **SupportAccessGrant:** who requested access, to which tenant or resource, why, who approved it, and when it expires.
+- **AuditEvent:** actor, effective subject, tenant, action, resource, result, time, request ID, and policy version.
+
+Six invariants—rules the system must never break—organize the entire design:
+
+1. Every customer resource belongs to exactly one tenant.
+2. The server derives the current principal from a verified session or access token.
+3. The server verifies the active tenant against current membership. A header, URL, or token claim is not enough by itself.
+4. Authorization evaluates the actual worker, payroll run, time-off request, or document loaded by the server, not merely an identifier supplied by the client.
+5. Tenant context survives every hop, including service calls, cache keys, queue messages, search filters, object keys, audit events, and deletion jobs.
+6. A shared process never stores the current tenant in global mutable state. Tenant context belongs to one request, transaction, job, or cache key.
+
+<Callout type="info" title="A login identity is not an employment record">
+The principal identifies the signed-in person. A worker profile represents that person's employment inside one company. Keeping them separate prevents the platform from accidentally joining or exposing a person's records across companies.
+</Callout>
+
+An effective authorization question can be written as:
+
+```text
+allow(subject, tenant, action, resource, context)?
+```
+
+That is more useful than asking only, “Is this user a manager?”
+
+## 3. APIs that make the security decisions explicit
+
+The API can be small:
+
+```http
+POST /v1/workers
+GET  /v1/workers/{worker_id}
+PATCH /v1/workers/{worker_id}
+
+POST /v1/workers/{worker_id}/relationships
+POST /v1/time-off-requests
+POST /v1/payroll-runs/{payroll_run_id}:approve
+
+POST /v1/workers/{worker_id}/documents:begin-upload
+POST /v1/uploads/{upload_id}:complete
+GET  /v1/documents/{document_id}/download
+
+POST /v1/session:select-tenant
+POST /v1/support-access-grants
+```
+
+The request body never defines the authenticated user. For the browser application, the server session contains the active tenant. A tenant ID in a hostname, path, or header is only a routing hint. The server must compare it with the tenant in the verified session or access token.
+
+For each object endpoint, the service loads the resource by active tenant and resource ID. It then checks the requested action and requested fields against the stored resource. Random UUIDs make guessing harder, but they do not replace resource authorization. OWASP calls this failure mode [Broken Object Level Authorization](https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/).
+
+The gateway also checks that the tenant has enabled the requested module. This is only a product check. The HR, time-off, or payroll service still performs user and resource authorization.
+
+## 4. Build the architecture incrementally
+
+Draw one flow at a time. Each diagram should answer one security question before you add more components.
+
+Select a step in the first three flows to inspect its security decision. The final service map adds each path to one architecture.
+
+### Step 1: establish identity and one active tenant
+
+<SecurityArchitectureFlow stage="identity" />
+
+The identity provider proves who the user is. The application then loads the user's membership and places one verified tenant in the server session. The API receives two trusted values: the principal ID and the active tenant ID.
+
+Customer SSO does not grant product access by itself. The application still requires an invitation, provisioning record, or administrator approval. OAuth tokens stay in the BFF instead of the browser.
+
+### Step 2: protect one employee record read
+
+<SecurityArchitectureFlow stage="authorization" />
+
+Now trace one `GET /workers/{worker_id}` request for compensation data. It passes three gates: a valid identity and membership, permission to read the stored worker and requested fields, and a database query constrained to the active tenant.
+
+The path and token provide inputs, but the current membership, organizational relationships, and worker record stored by the server are the sources of truth.
+
+### Step 3: add document upload
+
+<SecurityArchitectureFlow stage="upload" />
+
+The document API first authorizes an upload for a worker, such as an onboarding form or tax document, and creates an upload ticket. The client then sends bytes directly to quarantine. A presigned URL permits the transfer, but it does not approve the file. Only the exact version that passes the isolated scanner can move to the approved store.
+
+### Step 4: assemble the complete view
+
+<ServiceArchitectureDiagram diagram={secureSaasArchitecture} />
+
+After the first three flows work, add the shared workforce hub, HR, time-off, payroll, and document services. Then add background jobs, cache and search filters, workload identity, KMS, audit logging, and temporary support access. Use the numbered controls to build the service map, then select any component to inspect its security decision.
+
+The complete view separates several trust decisions that are often collapsed into “the backend”:
+
+- The identity provider authenticates a principal. It does not decide whether that principal may read compensation or approve a payroll run.
+- The policy system decides whether an action is allowed. Database, cache, and object storage still need tenant controls.
+- Module entitlement decides whether a company has a product. It does not decide which employee may use it.
+- The file processing environment accepts hostile inputs, so it is separated from application credentials and clean data.
+- Audit and support access use separate controls and credentials from the main application.
+
+### A shared workforce hub with product services around it
+
+The workforce hub owns the records every module needs: tenant, worker, department, manager relationship, legal entity, location, and employment status. HR, time-off, payroll, and document services sit around the hub. They use the same worker IDs and tenant IDs, but each service owns its product-specific state.
+
+For example, the time-off service owns requests, balances, and approval state. The payroll service owns payroll runs, payroll items, and calculation state. Neither service should edit the workforce hub's tables directly. They call a narrow API for current data or consume tenant-scoped events from an outbox. This creates one source of truth for each record and keeps one compromised service from gaining write access to every product.
+
+<Callout type="info" title="Hub and spoke does not mean one shared database account">
+A hub provides common records and identifiers. A product service should still own its tables and use its own restricted database role. Sharing one PostgreSQL cluster is an operational choice; it does not require every service to read or change every table.
+</Callout>
+
+Cross-product workflows need special care. If an approved compensation change affects the next payroll run, the HR service commits the change and an outbox event together. The event includes the tenant, worker, changed field category, version, actor, and trace ID. The payroll consumer processes it idempotently and checks that the worker and payroll run still belong to the same tenant. It never accepts an event that contains only a worker ID.
+
+## 5. Authentication, sessions, and JWT validation
+
+### Human login
+
+For a sensitive browser application, use the OIDC Authorization Code flow through a **backend for frontend (BFF)**. The BFF exchanges the authorization code and keeps access and refresh tokens on the server. The browser receives an opaque session cookie with `Secure`, `HttpOnly`, and an appropriate `SameSite` value. Routes that change data also need CSRF protection.
+
+<Callout type="info" title="OIDC, OAuth, and the BFF have different jobs">
+**OpenID Connect (OIDC)** signs a user in and tells the application who they are. **OAuth** gives a client limited access to an API. A **backend for frontend (BFF)** is a server dedicated to the browser application; it completes the login flow, stores OAuth tokens on the server, and gives the browser an opaque session cookie. “Opaque” means the cookie is only a random reference to server-side session data.
+</Callout>
+
+This design keeps OAuth bearer tokens out of `localStorage`, so browser XSS cannot read the tokens directly. Malicious browser code may still make requests as the signed-in user, so the application must also prevent XSS and protect sensitive actions. IETF guidance describes the BFF as the browser OAuth pattern with the strongest common security properties. A browser client using Authorization Code plus PKCE can still be reasonable for a lower-risk application that must call APIs directly. See [RFC 10017](https://www.rfc-editor.org/rfc/rfc10017.html).
+
+For native clients, use the system browser with Authorization Code plus PKCE. Store refresh credentials in the operating system credential store. Do not use the implicit flow or the resource owner password flow.
+
+### Login options and enterprise SSO
+
+An identity broker such as Auth0 can support several login methods without changing application authorization:
+
+- **Enterprise SSO:** Connect each customer to its OIDC or SAML identity provider.
+- **Passkeys:** Prefer them when the user population and devices support them.
+- **Email links or codes:** Treat them as no stronger than the user's mailbox security.
+- **Passwords:** Let the identity provider handle storage and reset. Enable compromised password detection, login rate limits, bot protection, and MFA.
+
+Authentication and tenant membership are separate records. A successful login or company email address must not automatically grant access to that company. Require an invitation, SCIM assignment, or tenant administrator approval. Automatic provisioning may create a user record, but it should not grant useful access without a trusted membership mapping.
+
+### ID tokens are not API access tokens
+
+An ID token tells the OIDC client about a login. An access token authorizes a request to an API. These tokens have different audiences and purposes, so an API should not accept an ID token as an access token.
+
+<Callout type="info" title="JWT is a format, not an authorization model">
+A JSON Web Token (JWT) is a signed container for claims such as the issuer, subject, audience, and expiration time. A valid signature proves who issued the token and that it was not changed. It does not prove that the user may perform every action in the application.
+</Callout>
+
+Use a maintained JWT library and a separate validation configuration for each token type:
+
+- Pin the expected issuer and obtain keys only from its trusted metadata/JWKS location.
+- Configure the allowed algorithms. Never let the untrusted `alg` header choose verification behavior.
+- Validate the signature, issuer (`iss`), audience (`aud`), expiration, not-before time (`nbf`), and token type.
+- Validate the client or authorized party when the token profile requires it.
+- Validate `org_id` or the equivalent tenant claim and bind it to a known tenant.
+- Cache signing keys for a limited period. Refresh safely when a new key ID appears. Never disable validation during key rotation.
+- Keep raw tokens and refresh credentials out of URLs and logs.
+
+These checks follow [RFC 8725](https://www.rfc-editor.org/rfc/rfc8725.html). Auth0 also requires APIs that accept organization tokens to validate the organization and separate access by `org_id` ([Auth0 Organizations token guidance](https://auth0.com/docs/manage-users/organizations/using-tokens)).
+
+### Do not classify people by token prefix
+
+Do not infer whether an actor is an employee, contractor, customer, or software workload from a prefix such as `dev_*` or `ext_*`.
+
+Use verified token fields and server records:
+
+- Trusted issuer and signing keys
+- Audience and token type
+- OAuth client ID or authorized party
+- Human or workload subject type
+- Authentication method and assurance (`amr` and `acr`)
+- Principal and membership records stored by the application
+- Explicit scopes and resource relationships
+
+Separate clients, audiences, and sometimes issuers prevent one token type from being used in the wrong place. When a service acts for a user, exchange the external token for a short-lived internal token with one audience. Keep both the user and acting service in the request context. [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693.html) calls this **delegation**: the service keeps its own identity while acting for the user. This is different from impersonation, where the service appears to be the user.
+
+### Tenant switching
+
+A user has one identity and may have several memberships. Treat tenant switching as a security operation:
+
+1. The user asks the BFF to select tenant B.
+2. The server verifies an active membership in tenant B and any required authentication assurance.
+3. The server creates a new session or token bound to tenant B.
+4. Caches associated with tenant A are discarded or partitioned.
+5. Every subsequent request carries only tenant B as its active context.
+6. The switch is audited.
+
+Do not put the user's full tenant and role list in a long-lived JWT. The list becomes stale after access changes and reveals organization memberships. Keep one active tenant in a short-lived token or server session, then load changing permissions from the authorization system.
+
+## 6. Roles plus resource relationships
+
+Use roles for broad permissions:
+
+- A tenant administrator can manage membership and SSO.
+- An HR administrator can change job and employment data.
+- A payroll administrator can prepare and approve payroll within a permitted region or legal entity.
+- A manager can approve time off for direct reports.
+- An employee can use a self-service portal.
+
+Roles alone cannot answer, “Can this manager read this worker's compensation?” Add rules based on organizational relationships, field sensitivity, legal entity, location, and current context:
+
+<Callout type="info" title="Roles and relationships answer different questions">
+A role grants broad abilities, such as allowing a manager to approve time off. A resource relationship describes how people and business units are connected, such as one worker reporting to another or an HR partner covering one department. The authorization rule combines both kinds of information.
+</Callout>
+
+```text
+allow read(worker.compensation) when
+  membership is active
+  and subject.tenant == worker.tenant
+  and tenant has HR module
+  and (
+       subject is the worker
+       or subject has payroll_admin for worker.legal_entity
+       or subject is hr_partner for worker.department
+       or subject has an approved temporary support grant
+      )
+```
+
+That rule is only an example. A company's policy may prevent employees from changing compensation, limit managers to less sensitive fields, or require approval before an administrator's change becomes effective.
+
+Each API enforces the decision before it reads or changes data. It builds an authorization request from data the server trusts and sends that request to the policy system. The policy system returns allow or deny. When several services share the same rules, keep those rules in one reviewed and tested policy system instead of copying them into every service. AWS describes this model in its [SaaS authorization guidance](https://docs.aws.amazon.com/prescriptive-guidance/latest/saas-multitenant-api-access-authorization/introduction.html).
+
+<Callout type="info" title="PEP and PDP separate enforcement from decisions">
+A **policy enforcement point (PEP)** is the API or service that blocks a request unless it is allowed. A **policy decision point (PDP)** evaluates the rules and returns allow or deny. The API remains responsible for enforcing the answer.
+</Callout>
+
+This policy logic runs in the request path introduced in the main design.
+
+Important implementation details:
+
+- Check permission on every request and deny by default, as recommended by the [OWASP Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html).
+- Filter list and search results before returning them. Use database predicates, authorization indexes, or batch checks instead of one network call per row.
+- Tokens can carry stable facts such as subject, issuer, audience, and active tenant. Keep changing reporting lines, employment status, payroll scope, and temporary grants in the authorization system.
+- Use short cache lifetimes plus an `authz_version` or invalidation event. An authorization version is a number that changes whenever permissions change, making older cached decisions invalid. Membership suspension and emergency grant removal should bypass the normal cache.
+- If the PDP is unavailable, deny writes, exports, payroll actions, sensitive employee reads, and permission changes. A recent cached decision may be acceptable for low-risk reads if the product policy allows it.
+- Test a matrix of subject, tenant, action, relationship, sensitivity, and lifecycle state. Include attempts to access another tenant in CI.
+
+Google's [Zanzibar paper](https://research.google/pubs/zanzibar-googles-consistent-global-authorization-system/) describes authorization based on relationship tuples. This design does not need Zanzibar's scale, but the model is useful for ownership, group membership, delegation, and inheritance.
+
+## 7. Tenant isolation in every data system
+
+Authentication, authorization, and isolation are related but different:
+
+- Authentication establishes who the principal is.
+- Authorization decides whether that principal may perform an action.
+- Tenant isolation ensures that even an authenticated and broadly authorized request cannot operate on the wrong tenant's resources.
+
+Authentication and normal authorization do not stop a valid user from reaching another tenant if the application loses tenant context. AWS makes the same point in its [SaaS authorization guidance](https://docs.aws.amazon.com/prescriptive-guidance/latest/saas-multitenant-api-access-authorization/introduction.html).
+
+### Shared PostgreSQL tables
+
+PostgreSQL is a reasonable starting point. Every table that stores customer data has a required `tenant_id`. Include it in unique indexes and foreign keys where practical:
+
+```sql
+CREATE UNIQUE INDEX worker_profiles_tenant_id_id
+  ON worker_profiles (tenant_id, id);
+
+ALTER TABLE time_off_requests
+  ADD CONSTRAINT time_off_worker_fk
+  FOREIGN KEY (tenant_id, worker_id)
+  REFERENCES worker_profiles (tenant_id, id);
+```
+
+This foreign key stops the database from attaching tenant A's time-off request to tenant B's worker.
+
+Use Row Level Security (RLS) as a second tenant check inside the database:
+
+```sql
+ALTER TABLE worker_profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE worker_profiles FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_boundary ON worker_profiles
+  USING (tenant_id = current_setting('app.tenant_id')::uuid)
+  WITH CHECK (tenant_id = current_setting('app.tenant_id')::uuid);
+```
+
+<Callout type="info" title="Row Level Security is a database backstop">
+PostgreSQL Row Level Security (RLS) applies a rule whenever a role reads or changes a table. Here, the rule exposes only rows whose `tenant_id` matches the current transaction. It can catch a missing tenant filter in application code, but it does not replace the application's full permission check.
+</Callout>
+
+At the start of each transaction, the data layer sets the verified tenant ID as transaction-local state. The application role must not own the table, be a superuser, or have `BYPASSRLS`, because these roles normally bypass RLS. Table owners also require `FORCE ROW LEVEL SECURITY` ([PostgreSQL RLS documentation](https://www.postgresql.org/docs/current/ddl-rowsecurity.html)).
+
+RLS is defense in depth, not the entire authorization system. In other words, it adds another protection in case the application makes a mistake. It usually cannot express every reporting line, allowed field, approval rule, or module entitlement. It also does not protect object storage, search, caches, queues, analytics, or logs.
+
+### Other systems that need tenant context
+
+- **Cache:** Start every key with a stable tenant ID. Use `tenant:{tenant}:worker:{id}`, not `worker:{id}`. Never keep the active tenant in a process-wide variable.
+- **Queue:** messages include tenant, resource, initiating actor, authorization version, trace ID, and an idempotency key. Workers use their own workload identity and revalidate sensitive state before acting.
+- **Search and vector stores:** The server always supplies the tenant filter. Deletion also covers chunks, embeddings, and indexes.
+- **Analytics and exports:** Jobs read a snapshot for one tenant and write to a destination for that tenant. Cross-module reports preserve both tenant and field-level permissions.
+- **Observability:** Tenant IDs may be useful. Raw records, JWTs, and sensitive personal data do not belong in logs.
+- **Backups:** restores must not resurrect access or deleted records. Reapply membership state and the deletion ledger before making a restored system available.
+
+### Choosing an isolation model
+
+| Model | Advantages | Costs and risks | Good fit |
+|---|---|---|---|
+| Shared tables and services | Lowest cost and simplest operations | A scoping bug can affect more tenants | Default for many SaaS workloads with strong RLS and tests |
+| Schema or database per tenant | Clearer boundary and easier restore for one tenant | More connections, migrations, and databases to operate | Larger customers or moderate regulatory needs |
+| Account, project, or cluster per tenant | Strong cloud and failure boundary | Highest cost and deployment complexity | Required isolation or a small number of high-value tenants |
+| Deployment cells | Limits the impact of failure while sharing resources inside each cell | Requires tenant placement, routing, and cell operations | A practical growth path for a mature platform |
+
+AWS describes pool, silo, and hybrid approaches and notes that silo provides stronger isolation at greater cost and complexity ([AWS multi-tenant architecture guidance](https://docs.aws.amazon.com/solutions/multi-tenant-architectures-on-aws/)).
+
+Make isolation a placement choice rather than an application rewrite. A tenant directory maps each tenant to a cell, database, bucket or access point, KMS key, and policy store. Small companies can use the shared pool. A regulated enterprise can move to a dedicated database, account, or cluster without changing every API.
+
+Public platforms show that more than one model can work. Workday documents a shared physical multitenant service with logical customer-data separation. ServiceNow documents a multi-instance model with customer-specific databases. Our fictional platform starts with shared services and tables, then offers stronger placement boundaries when risk or contracts require them.
+
+## 8. Safe file upload, parsing, and download
+
+File parsers process untrusted input and often contain vulnerabilities. Do not trust the file extension or the content type sent by the browser.
+
+The upload path keeps untrusted files away from the application and approved document store.
+
+### Upload broker
+
+The client first requests an upload ticket for a worker record it can modify. The service creates a random object key and records the tenant, worker, document category, actor, expected size, type, checksum, and expiration. It returns a presigned POST or PUT URL that is valid for a short time and can write only that key in the quarantine bucket.
+
+The server creates the object key. It does not include a person's name, email address, or document title. Block public access and enforce bucket owner ownership. Only the upload service can create upload URLs, and the bucket policy limits where those URLs can write.
+
+A presigned URL is a bearer credential: anyone who has the URL can use the permission it carries. AWS documents that the URL can be reused until it expires ([S3 presigned URL documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html)). To make it behave like a single-use upload, create a unique key, track one upload ticket, keep the expiration short, and accept only the first object version with the expected checksum. A bucket policy can also limit the age of the signature.
+
+<Callout type="info" title="A presigned URL permits transfer, not trust">
+A presigned URL gives the browser temporary permission to upload or download one object without receiving cloud credentials. It does not identify the current user, prove that an uploaded file is safe, or provide one-time-use behavior by itself.
+</Callout>
+
+### Asynchronous scanning
+
+An object creation event sends a scan job to a durable queue. S3 notifications can arrive more than once or out of order. Use the exact object version as the job key, and make every state change safe to repeat ([S3 event notification documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/notification-how-to-event-types-and-destinations.html)).
+
+<Callout type="info" title="Idempotent jobs are safe to repeat">
+An idempotent job produces the same final state when it runs more than once. This matters because queues may deliver the same message again after a timeout or worker failure.
+</Callout>
+
+The pipeline checks:
+
+- Allowed extension and MIME family
+- Magic bytes and agreement between claimed and detected type
+- Maximum size, page count, archive depth, expansion ratio, and nested object count
+- Malware and dangerous active content
+- Content disarm and reconstruction when appropriate—that is, remove active content and rebuild a safer copy
+- Parser completion within CPU, memory, file, and time limits
+
+OWASP recommends allowing only expected types, renaming files, limiting size, storing files outside the web root, and using antivirus, sandboxing, or content disarm when appropriate ([OWASP File Upload Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html)).
+
+### Parser isolation
+
+Assume the parser may be compromised:
+
+- Run as a non-root user with a read-only base filesystem.
+- Drop Linux capabilities and apply a restrictive seccomp, AppArmor, or SELinux profile.
+- Do not mount application secrets or a Kubernetes service account token.
+- Deny outbound network access, including cloud metadata endpoints.
+- Allow reads from only one quarantined object. Allow writes only through a narrow promotion API.
+- Enforce resource limits and destroy the environment after the job.
+- Use a stronger sandbox or separate cluster when the file risk requires it.
+
+The scanner cannot query worker or payroll data or read approved documents. If it is compromised, the attacker should see only the current quarantined object.
+
+### Download broker
+
+Documents remain unavailable while their state is `PENDING`, `QUARANTINED`, or `REJECTED`. Before download, the API checks the current user, current worker record, document category, and exact document version again.
+
+For normal approved documents, return a presigned GET URL with a short lifetime. For tax forms, identity documents, or other restricted records, stream the file through a download service when the product requires immediate revocation, redaction, watermarking, or detailed access logs. Streaming costs more because the service must handle every byte.
+
+## 9. Kubernetes, containers, and workload isolation
+
+Kubernetes runs and scales the platform services, but a container is not automatically a customer boundary. In the default design, Kubernetes deploys replicas of the HR, time-off, payroll, and document services. Each replica can handle requests for many tenants.
+
+If one payroll container handles a request for company A and then a request for company B, both requests ran inside the same process. A container does not clear global variables, connection pools, or in-memory caches between requests. The service must keep the tenant in request-local context, pass it explicitly to tenant-aware data access methods, and include it in every cache key. Code review and concurrency tests should reject global `currentTenant` variables and tenant-free repository methods such as `findWorker(id)`.
+
+<Callout type="info" title="Container isolation is not tenant isolation">
+A container separates one workload process from other processes on the host. It does not separate two customer requests handled by the same process, and it does not add tenant filters to a shared database. Tenant isolation still comes from verified request context, authorization, tenant-scoped queries, RLS, storage policy, and tests.
+</Callout>
+
+Running one pod or namespace per customer can create another boundary, but it costs more and still does not fix an incorrectly shared database credential or query. Use per-tenant compute only when a contract, customer-supplied code, unusual resource usage, or a higher isolation tier justifies it. Kubernetes itself notes that namespaces need supporting RBAC and network policies, and that containers provide a weaker boundary than virtual machines.
+
+Use Kubernetes boundaries for **workload trust zones**:
+
+- Edge and BFF
+- Application APIs
+- Untrusted file processors
+- Security and audit collectors
+- Administrative tools
+
+Use workload identity instead of static cloud credentials. Apply network policies that deny traffic by default, restricted pod security settings, resource limits, narrowly scoped service accounts, and admission controls. Put file parsers or customer code in sandboxes, on separate nodes, or in separate clusters when they need a stronger boundary. See the [Kubernetes multitenancy guidance](https://kubernetes.io/docs/concepts/security/multi-tenancy/).
+
+<Callout type="info" title="Workload identity identifies software services">
+A workload identity is a short-lived identity issued to a running service. It replaces shared API keys or cloud credentials stored in configuration. The system can then give each service only the network and cloud permissions it needs.
+</Callout>
+
+For calls between services, use workload identity with short-lived credentials and mutual TLS (mTLS) where practical. With mTLS, both services present certificates and verify each other. Keep the service identity separate from the user who started the operation. SPIFFE is one standard way to issue workload identities without shipping a static secret with every service ([SPIFFE overview](https://spiffe.io/docs/latest/spiffe-about/overview/)).
+
+## 10. API and integration hardening
+
+The same policy path protects browser, mobile, partner, and internal APIs. Important details include:
+
+- **Object and function authorization:** Check the target resource and requested operation on every route.
+- **Mass assignment:** Map accepted fields explicitly. Never bind request data directly to `tenant_id`, `worker_id`, `role`, `compensation`, `payroll_state`, or `scan_state`.
+- **Pagination:** Sign cursors or keep them opaque. Bind them to the tenant, query, and sort order.
+- **Idempotency:** Scope each key to the tenant, principal or client, route, and operation.
+- **Rate limits:** Combine IP, session, user, tenant, client, and endpoint cost. A tenant quota limits damage from one noisy customer.
+- **GraphQL:** Enforce policy in resolvers or the data layer. Limit query depth and cost. Do not let node IDs bypass tenant filtering.
+- **Inbound webhooks:** Verify the signature, tenant, timestamp, and unique event ID. Reject replays.
+- **Outbound webhooks:** Give each tenant a different secret or key. Sign the timestamp and body, rotate keys, retry safely, and block access to internal networks.
+- **Machine credentials:** Prefer asymmetric client authentication or managed workload identity. Give each integration its own principal, audience, and narrow scopes.
+- **Provisioning:** SCIM deactivation should disable membership and sessions. Allow only approved mappings from identity provider groups to application roles.
+- **Errors:** Return consistent errors that do not reveal whether another tenant owns a resource. Keep detailed reasons in protected logs.
+
+<Callout type="info" title="Four API hardening terms">
+**Mass assignment** happens when a framework copies request fields directly into a stored object, including fields the user should not control. A **signed cursor** lets the server detect changes to pagination state. A **webhook** is an HTTP request one system sends to notify another system about an event. **SCIM** is a standard that organizations use to create, update, and deactivate user accounts in connected applications.
+</Callout>
+
+## 11. Audit logs
+
+Audit at least:
+
+- Login, logout, recovery, MFA, and SSO changes
+- Tenant switches and session revocation
+- Membership, role, reporting-line, module entitlement, and policy changes
+- Sensitive employee reads, compensation changes, payroll approvals, downloads, exports, and deletions
+- Document upload and scan results
+- API credential creation and rotation
+- Tax, bank, identity, and health data access, plus every support access action
+- KMS key use and key policy changes
+- Authorization denials and suspicious volume
+
+Each event records the actual actor, effective subject if different, tenant, action, resource ID and classification, result, reason, policy version, time, trace ID, client or workload identity, and useful network context.
+
+Do not log access tokens, refresh tokens, passwords, encryption keys, connection strings, document contents, or unnecessary personal data. OWASP recommends removing, masking, hashing, or encrypting sensitive values and protecting logs from changes or deletion ([OWASP Logging Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html)).
+
+For important changes, write an audit outbox record in the same database transaction as the business update. A background publisher sends it to an append-only stream and an archive that application services cannot change. This prevents a compensation change, payroll approval, role change, or export from completing without an audit record when the log service is unavailable. The audit system uses separate credentials, limited reader access, integrity monitoring, and its own access logs.
+
+<Callout type="info" title="The transactional outbox keeps data and audit events together">
+A transactional outbox writes the business change and a pending event in the same database transaction. A separate publisher sends that event later. Either both database records are saved or neither is, so a temporary logging outage does not create an unaudited change.
+</Callout>
+
+## 12. Retention, deletion, encryption, and legal hold
+
+Start retention design with data classification. Map each class of data to its retention, deletion, archive, and legal hold rules. A legal hold pauses normal deletion when data must be preserved for a legal matter.
+
+A deletion workflow should:
+
+1. Authorize and record the request.
+2. Create a tombstone and make the record inaccessible.
+3. Check legal hold and contractual retention.
+4. Queue safe, repeatable deletion for database rows, all object versions, thumbnails, OCR text, search documents, embeddings, caches, exports, and analytics data.
+5. Record completion or exceptions in a deletion ledger.
+6. Let encrypted backups expire on a documented schedule.
+7. After a backup restore, replay tombstones before serving traffic.
+
+Versioned object storage needs explicit deletion rules. A normal delete may add only a delete marker while older versions remain. S3 has separate expiration controls for current and previous versions ([S3 lifecycle documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-rules.html)). Legal hold overrides routine deletion. Releasing a hold returns the object to its normal schedule.
+
+Use envelope encryption for sensitive data. A key management service (KMS) generates or unwraps a data encryption key. The application uses the plaintext data key briefly with an authenticated cipher, then clears it from memory. Store the encrypted data, the wrapped data key, and required metadata together. The master key stays inside KMS. Include the tenant ID in the encryption context so KMS can verify it and enforce it in policy ([AWS KMS encryption context documentation](https://docs.aws.amazon.com/kms/latest/developerguide/encrypt_context.html)).
+
+<Callout type="info" title="Envelope encryption limits use of the master key">
+The application encrypts data with a short-lived data key, then encrypts that data key with a master key held by KMS. The master key never leaves KMS. An encryption context adds authenticated facts—such as the tenant ID—that must match when the data key is decrypted.
+</Callout>
+
+A KMS key for each tenant gives a clearer audit and revocation boundary, but it creates more keys, grants, quotas, and operational work. A common default is one key per deployment cell or data class, with tenant ID in the encryption context. Give a tenant a dedicated key when its contract or risk requires one. Encryption does not fix an application bug that loads data from the wrong tenant, so it never replaces authorization and isolation.
+
+## 13. Emergency and support access
+
+Separate two problems:
+
+1. **Product support access** to a customer's records.
+2. **Infrastructure emergency access** when normal corporate identity or administrative controls are unavailable.
+
+Do not give support staff permanent global read access. Use a temporary grant:
+
+1. A named support user requests a tenant, worker or payroll resource, set of actions, duration, and support ticket.
+2. Policy determines whether customer approval, internal approval, or both are required.
+3. The user completes phishing-resistant MFA.
+4. The system issues a short-lived grant that is read-only by default. Export and permission changes require separate approval.
+5. The UI shows that support mode is active. Audit events record both the support user and customer context.
+6. Security and, when appropriate, the customer receive immediate notification.
+7. The grant expires automatically and is reviewed afterward.
+
+AWS describes the same pattern as requesting, approving, and tracking a permission for one task and time window ([AWS temporary elevated access](https://docs.aws.amazon.com/singlesignon/latest/userguide/temporary-elevated-access.html)).
+
+Infrastructure emergency accounts must remain usable when the normal identity system is down. Keep them separate from normal accounts, protect them with independent authenticators, alert on every use, and test them. Do not use them for routine customer data access.
+
+## 14. Main attack paths
+
+1. **Change a worker ID to read another tenant.** The API checks login but not the stored worker. Load the worker by active tenant and worker ID, then run the policy and field checks. Composite keys, RLS, and tests that confirm unauthorized requests are rejected provide backstops.
+2. **Keep access after termination or a reporting-line change.** A long-lived token contains stale roles. Use short-lived sessions or tokens, load current membership and relationships, and send cache invalidation when access changes.
+3. **Trick a background worker into misusing its authority.** A queue message contains only an object ID or reusable user token, so the worker cannot tell who requested the action or which tenant owns the object. Include the tenant, resource, operation, actor, and authorization version. The worker uses its own identity and checks current state.
+4. **Compromise a document parser.** An uploaded PDF reaches a trusted workload. Store it in quarantine and scan it in an isolated worker with no application secrets or outbound network access.
+5. **Reuse a leaked presigned URL.** The application assumes the URL is bound to user identity or can be used once. Use a unique object key, short expiration, ticket state, exact version checks, and download authorization.
+6. **Return another tenant's cached or indexed result.** A cache key or search filter omits tenant ID. Put the tenant in every key and supply filters from server context. Test with worker records that have the same resource ID in different tenants.
+7. **Let support staff browse customer data.** A permanent support role has global access. Require a scoped temporary grant, approval, MFA, expiration, notification, and review.
+8. **Leave deleted data in another system.** Only the main database row is removed. Track deletion across object versions, search, OCR, embeddings, exports, analytics, caches, and backup restores.
+9. **Leak data through shared process memory.** A service stores `currentTenant` or an unscoped result cache in global memory. Keep tenant context request-local, use tenant-aware cache keys, and run concurrency tests that mix requests from several tenants.
+10. **Treat a module subscription as permission.** A tenant has enabled payroll, so every member can call payroll APIs. Check entitlement first, then still check the user's role, organizational scope, target resource, requested fields, and required approval.
+
+## 15. Important tradeoffs
+
+| Decision | Recommended default | Choose the alternative when… |
+|---|---|---|
+| BFF session vs browser OAuth token | BFF for sensitive web applications | A public browser application must call APIs directly and can safely manage PKCE and token refresh |
+| JWT permissions vs central authorization | JWT for identity, audience, and active tenant. Central policy for changing grants | The permission stays stable for the full token lifetime |
+| Shared DB vs DB per tenant | Shared tables with composite keys, RLS, and cells | Contracts, residency, restore needs, or risk require a dedicated boundary |
+| Direct S3 upload vs API proxy | Direct upload to quarantine through the upload broker | Files are small or the service must inspect every byte during upload |
+| Presigned download vs service streaming | Short-lived signed download for normal approved files | Immediate revocation, watermarking, redaction, or detailed access logs justify the service cost |
+| KMS key per tenant vs shared cell key | Cell or data class key with tenant encryption context | A contract or risk requires separate key lifecycle and audit |
+| Remote PDP vs local policy engine | Central policy management with local or batch evaluation where latency matters | Policies are simple, local to one service, and still reviewed consistently |
+| Container or namespace per customer vs shared workloads | Share stateless service replicas and isolate each request and data access | Customers run code, have unusual resource needs, or require dedicated compute boundaries |
+
+## 16. Interview questions and short answers
+
+### How should employee and contractor access differ?
+
+Do not use a token prefix to classify people. Validate the token type and client, then load memberships and the tenant-owned worker profile from the server. Employment type belongs to that worker profile because the same person can be an employee of one company and a contractor for another. Contractors can receive narrower relationships, shorter sessions, export limits, and stronger device or MFA requirements.
+
+### Why not put every tenant and permission in the JWT?
+
+Permissions become stale, tokens become large, and revocation becomes difficult. Put stable identity facts and one active tenant in a short-lived token. Evaluate changing roles, reporting lines, payroll scopes, allowed fields, and temporary grants in the authorization system.
+
+### JWT or opaque access token?
+
+JWTs allow local verification but are harder to revoke immediately. Opaque tokens support central session state and revocation, but require a lookup or distributed cache. A BFF browser cookie should normally be an opaque session handle. Internal APIs can use short-lived JWTs with one audience.
+
+### What is the best passwordless option?
+
+Passkeys resist phishing. Email links inherit the mailbox's security. SMS codes are weaker against number takeover and interception. Design account recovery and authenticator enrollment with the same care as login.
+
+### How does enterprise SSO onboarding work?
+
+Configure an enterprise connection for the tenant and verify its domains. Still require an invitation, SCIM assignment, or approved membership mapping. The customer's identity provider authenticates the person. The SaaS platform decides tenant and product access.
+
+### How do we revoke access within seconds?
+
+Disable the membership and its sessions. Increment the authorization version and invalidate policy caches. Require a fresh check for sensitive actions. Keep access tokens brief. Use a targeted deny list only when the immediate risk justifies the extra state.
+
+### What if the authorization service is down?
+
+Deny writes, payroll actions, restricted employee-data reads, exports, permission changes, and support access. A local evaluator or recent cached decision may preserve low-risk reads under an explicit product policy. Never turn an outage into “allow all” behavior.
+
+### Is PostgreSQL RLS enough?
+
+No. RLS is a useful backstop for database rows, but some database roles bypass it. It also does not protect object storage, search, caches, queues, exports, or incorrect permissions inside one tenant.
+
+### When do we dedicate a database or account to a tenant?
+
+Use a dedicated boundary when contracts, residency, separate keys, restore needs, unusual workload size, or breach impact justify the operational cost. Deployment cells are often the intermediate step.
+
+### Should every customer get a Kubernetes namespace?
+
+Usually not. Namespace boundaries are more useful between workloads with different trust levels. Shared service replicas are more efficient for the normal product tier. Use dedicated customer compute when customers deploy workloads, run untrusted code, have unusual resource needs, or require a dedicated isolation tier.
+
+### Do containers stop one tenant's memory from leaking to another?
+
+Not when the same service process handles both tenants. Containers isolate the service from other workloads, but request objects, global variables, connection pools, and in-memory caches inside that service are shared. Keep tenant context request-local, avoid mutable tenant globals, partition caches, clear request data, and test concurrent requests from different tenants.
+
+### Can a presigned URL be used only once?
+
+No. It can normally be reused until it expires. To make it behave like a single-use URL, create a unique key, track one application ticket, keep the expiration short, validate the exact checksum and version, and accept only the first valid completion.
+
+### Why quarantine files if the bucket is private?
+
+A private bucket prevents public reads. It does not make the bytes safe to parse. Quarantine keeps untrusted files away from approved content and workloads with broad application credentials.
+
+### How should background jobs preserve user authority?
+
+The worker uses its own workload identity. The message carries tenant, resource, operation, initiating actor, authorization version, and trace ID. It does not carry a reusable browser token. Before a sensitive operation, the worker checks current authorization and resource state.
+
+### How do list endpoints avoid one authorization call per item?
+
+Translate policy into database filters for the tenant and allowed relationships, maintain an index of allowed resources, or use batch authorization checks. Test that list filtering and single resource checks return the same decisions.
+
+### What happens to data in backups after deletion?
+
+Backups expire on a documented schedule and are not edited in place. After a restore, replay deletion tombstones and revoked memberships before the service receives traffic.
+
+### Does encryption solve tenant isolation?
+
+No. Storage encryption protects disks and object media. If an application role can ask KMS to decrypt every tenant's data, an application bug can still expose the wrong record. Limit KMS use by workload and tenant context, and keep all application isolation controls.
+
+## 17. How to present the design
+
+Do not stop after naming products and services. Trace identity, authority, and data through the system:
+
+1. Where did the principal identity come from?
+2. How was the active tenant selected and verified?
+3. Which service loaded the tenant stored on the resource?
+4. Where did the resource authorization check run?
+5. What backstop catches a missing check?
+6. What user and tenant context crosses a queue or service boundary?
+7. When does a permission change take effect?
+8. What is audited, and can the actor alter that evidence?
+9. Where else does the data live when retention or deletion occurs?
+10. How much of the platform is exposed if this one component is compromised?
+
+Close with the main design:
+
+> The identity provider verifies the user. The application verifies one active company. The shared HR, time-off, payroll, and document services check module entitlement, user permission, organizational relationship, requested fields, and the stored resource. The database applies a second tenant check. Kubernetes isolates workloads, while request and data controls isolate customers. Uploaded files remain in quarantine until an isolated scanner approves the exact version. Support access requires approval, has a narrow scope, and expires automatically.
+
+Every detailed decision should support one of those controls.
+
+## Further reading
+
+- [HelloInterview: System Design Delivery Framework](https://www.hellointerview.com/learn/system-design/in-a-hurry/delivery)
+- [IETF RFC 10017: OAuth 2.0 for Browser-Based Applications](https://www.rfc-editor.org/rfc/rfc10017.html)
+- [IETF RFC 9700: Best Current Practice for OAuth 2.0 Security](https://www.rfc-editor.org/rfc/rfc9700.html)
+- [IETF RFC 8725: JSON Web Token Best Current Practices](https://www.rfc-editor.org/rfc/rfc8725.html)
+- [OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html)
+- [Auth0: Work with Tokens and Organizations](https://auth0.com/docs/manage-users/organizations/using-tokens)
+- [OWASP Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html)
+- [OWASP API Security: Broken Object Level Authorization](https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/)
+- [AWS: Multi-Tenant SaaS Authorization and API Access Control](https://docs.aws.amazon.com/prescriptive-guidance/latest/saas-multitenant-api-access-authorization/introduction.html)
+- [Rippling Engineering: Hub-and-Spoke Backend and PEO Multitenancy](https://www.rippling.com/blog/how-a-team-of-only-10-engineers-built-ripplings-peo-from-scratch)
+- [Rippling: Role-Based Permissions and the Employee Graph](https://www.rippling.com/blog/introducing-role-based-permissions-get-complete-control-over-the-data-and-apps-that-your-team-can-manage)
+- [Rippling Engineering: Real-Time Reporting Across Product Data](https://www.rippling.com/blog/ripplings-real-time-reporting-engine)
+- [Workday: One-to-Many Delivery and Logical Data Segregation](https://www.workday.com/en-us/legal/universal-contract-terms-and-conditions/umsa/faq.html)
+- [ServiceNow: Securing the Now Platform](https://www.servicenow.com/standard/resource-center/ebook/ebk-how-servicenow-delivers-safe-and-secure-cloud-services.html)
+- [Google Research: Zanzibar](https://research.google/pubs/zanzibar-googles-consistent-global-authorization-system/)
+- [PostgreSQL: Row Security Policies](https://www.postgresql.org/docs/current/ddl-rowsecurity.html)
+- [OWASP File Upload Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html)
+- [AWS: S3 Presigned URLs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html)
+- [Kubernetes: Multi-Tenancy](https://kubernetes.io/docs/concepts/security/multi-tenancy/)
+- [OWASP Logging Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html)
+- [AWS: Temporary Elevated Access](https://docs.aws.amazon.com/singlesignon/latest/userguide/temporary-elevated-access.html)

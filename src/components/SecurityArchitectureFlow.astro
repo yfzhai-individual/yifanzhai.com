@@ -1,0 +1,502 @@
+---
+type Stage = 'identity' | 'authorization' | 'upload' | 'overview';
+
+interface FlowNode {
+  title: string;
+  note: string;
+  zone: string;
+  decision: string;
+  prevents: string;
+}
+
+interface FlowDefinition {
+  title: string;
+  summary: string;
+  nodes: FlowNode[];
+}
+
+interface Props {
+  stage: Stage;
+}
+
+const flows: Record<Stage, FlowDefinition> = {
+  identity: {
+    title: 'Login and active tenant',
+    summary: 'Authentication proves identity. Membership selects one tenant.',
+    nodes: [
+      {
+        title: 'Start login',
+        note: 'Browser sends the user to the login flow',
+        zone: 'Browser',
+        decision: 'Treat the browser as untrusted. It should receive only an opaque application session cookie.',
+        prevents: 'OAuth token theft from browser storage and client supplied identity.',
+      },
+      {
+        title: 'Authenticate user',
+        note: 'OIDC, customer SSO, passkey, or password plus MFA',
+        zone: 'Identity provider',
+        decision: 'The identity provider verifies the user. It does not grant access to an application tenant.',
+        prevents: 'A successful login being treated as automatic tenant membership.',
+      },
+      {
+        title: 'Complete code flow',
+        note: 'BFF exchanges the code and validates the response',
+        zone: 'Application edge',
+        decision: 'Validate issuer, audience, state, and nonce. Keep OAuth tokens on the server.',
+        prevents: 'Token substitution, login CSRF, and use of a token issued for another audience.',
+      },
+      {
+        title: 'Load membership',
+        note: 'Check the chosen tenant against current server data',
+        zone: 'Membership store',
+        decision: 'Require an active membership created by an invitation, SCIM assignment, or administrator approval.',
+        prevents: 'Access based only on an email domain or a tenant ID supplied by the browser.',
+      },
+      {
+        title: 'Create session',
+        note: 'Bind principal ID and one active tenant ID',
+        zone: 'Application session',
+        decision: 'Create a new session or token whenever the user switches tenants.',
+        prevents: 'Requests carrying ambiguous or stale authority for several tenants.',
+      },
+    ],
+  },
+  authorization: {
+    title: 'One employee-data request',
+    summary: 'Each request passes identity, field policy, and tenant isolation checks.',
+    nodes: [
+      {
+        title: 'Receive request',
+        note: 'GET /workers/{worker_id}?fields=compensation',
+        zone: 'API edge',
+        decision: 'Read the principal and active tenant from the verified session or API token.',
+        prevents: 'A request body, path, or header defining its own identity or tenant authority.',
+      },
+      {
+        title: 'Check identity and tenant',
+        note: 'Validate credential and load current membership',
+        zone: 'Gate 1',
+        decision: 'Reject expired credentials, inactive membership, wrong audience, or a tenant mismatch.',
+        prevents: 'A valid user reaching a tenant after removal or using a token in the wrong service.',
+      },
+      {
+        title: 'Load worker and check policy',
+        note: 'Use active tenant ID plus worker ID',
+        zone: 'Gate 2',
+        decision: 'Evaluate role, relationship to the worker, requested fields, legal entity, and current temporary grants.',
+        prevents: 'Object ID changes, stale reporting lines, and access to compensation or tax data without permission.',
+      },
+      {
+        title: 'Run tenant-scoped query',
+        note: 'Composite keys, transaction tenant, and RLS',
+        zone: 'Gate 3',
+        decision: 'Set tenant context inside the transaction and use a database role that cannot bypass row security.',
+        prevents: 'A missing application filter returning or changing a row owned by another tenant.',
+      },
+      {
+        title: 'Return and audit',
+        note: 'Filter fields and record allow or deny',
+        zone: 'Response',
+        decision: 'Return only allowed fields. Record actor, tenant, action, resource, result, policy version, and trace ID.',
+        prevents: 'Sensitive field disclosure, tenant enumeration, and security actions without evidence.',
+      },
+    ],
+  },
+  upload: {
+    title: 'Document upload',
+    summary: 'Untrusted bytes stay in quarantine until an isolated worker approves one exact version.',
+    nodes: [
+      {
+        title: 'Create upload ticket',
+        note: 'Authorize worker record and bind upload conditions',
+        zone: 'Document API',
+        decision: 'Record tenant, worker, document category, actor, object key, size, type, checksum, and expiration.',
+        prevents: 'Uploading to an arbitrary key or attaching a document to a worker the user cannot change.',
+      },
+      {
+        title: 'Upload to quarantine',
+        note: 'Short presigned URL for one private object key',
+        zone: 'Untrusted storage',
+        decision: 'Block public access, keep object versions, and never serve files from quarantine.',
+        prevents: 'A presigned upload being treated as proof that a file is safe.',
+      },
+      {
+        title: 'Queue scan job',
+        note: 'Key the job by exact object version',
+        zone: 'Durable queue',
+        decision: 'Assume duplicate and out-of-order events. Make every state change safe to repeat.',
+        prevents: 'Duplicate notifications promoting the wrong version or corrupting document state.',
+      },
+      {
+        title: 'Scan in isolation',
+        note: 'Validate type, checksum, malware, and parser limits',
+        zone: 'Sandbox',
+        decision: 'Give the worker access to one object, no application secrets, and no outbound network.',
+        prevents: 'A malicious file turning parser compromise into access to customer data or cloud credentials.',
+      },
+      {
+        title: 'Promote exact version',
+        note: 'Set AVAILABLE or REJECTED',
+        zone: 'Approved storage',
+        decision: 'Move or copy only the scanned version. Store its checksum and final scan result.',
+        prevents: 'A file changing after inspection or an unscanned version reaching approved storage.',
+      },
+      {
+        title: 'Check before download',
+        note: 'Authorize the user, worker, and document category again',
+        zone: 'Download API',
+        decision: 'Issue a brief GET URL for normal files or stream restricted files through the service.',
+        prevents: 'A previous upload permission or leaked URL becoming permanent read access.',
+      },
+    ],
+  },
+  overview: {
+    title: 'Complete architecture',
+    summary: 'The request, file, and security paths use separate trust boundaries.',
+    nodes: [
+      {
+        title: 'Identity and tenant',
+        note: 'OIDC, BFF, membership, and one active tenant',
+        zone: 'Request path',
+        decision: 'Establish the principal and tenant before application code handles a resource request.',
+        prevents: 'Downstream services guessing identity or accepting tenant context directly from the client.',
+      },
+      {
+        title: 'API and policy',
+        note: 'Load resource, then check role and relationship',
+        zone: 'Application path',
+        decision: 'Keep policy inputs explicit: subject, tenant, action, resource, and current context.',
+        prevents: 'Broad role checks replacing permission checks on the actual resource.',
+      },
+      {
+        title: 'Tenant data',
+        note: 'PostgreSQL, cache, search, and approved objects',
+        zone: 'Data path',
+        decision: 'Carry tenant ID into every key, query, filter, object reference, and background job.',
+        prevents: 'Correct API policy being undone by a cache, search, queue, or storage scoping bug.',
+      },
+      {
+        title: 'Untrusted files',
+        note: 'Upload broker, quarantine, queue, and isolated scan',
+        zone: 'File boundary',
+        decision: 'Keep hostile bytes and parser workloads away from normal application credentials and data.',
+        prevents: 'Parser compromise spreading into the main application or approved object store.',
+      },
+      {
+        title: 'Audit and support',
+        note: 'Immutable events and temporary support grants',
+        zone: 'Security path',
+        decision: 'Use separate credentials and retention. Support grants require approval, narrow scope, and expiration.',
+        prevents: 'Application compromise erasing evidence or support staff receiving permanent global access.',
+      },
+      {
+        title: 'Platform controls',
+        note: 'Workload identity, KMS, network policy, and limits',
+        zone: 'Infrastructure',
+        decision: 'Give each workload the minimum cloud and network access required for its task.',
+        prevents: 'One compromised service gaining broad credentials or unrestricted access to other trust zones.',
+      },
+    ],
+  },
+};
+
+const { stage } = Astro.props;
+const flow = flows[stage];
+const componentId = `security-flow-${stage}`;
+const firstNode = flow.nodes[0];
+---
+
+<section class="security-flow" id={componentId} data-security-flow aria-label={flow.title}>
+  <header class="security-flow__header">
+    <p class="security-flow__title">{flow.title}</p>
+    <p class="security-flow__summary">{flow.summary}</p>
+  </header>
+
+  <ol class="security-flow__steps" aria-label={`${flow.title} steps`}>
+    {flow.nodes.map((node, index) => (
+      <li class="security-flow__step">
+        <span class="security-flow__number" aria-hidden="true">{index + 1}</span>
+        <button
+          class="security-flow__node"
+          type="button"
+          aria-pressed={index === 0 ? 'true' : 'false'}
+          aria-controls={`${componentId}-detail`}
+          data-flow-node
+          data-title={node.title}
+          data-zone={node.zone}
+          data-decision={node.decision}
+          data-prevents={node.prevents}
+        >
+          <span class="security-flow__zone">{node.zone}</span>
+          <strong>{node.title}</strong>
+          <span>{node.note}</span>
+        </button>
+      </li>
+    ))}
+  </ol>
+
+  <div class="security-flow__detail" id={`${componentId}-detail`} aria-live="polite">
+    <p class="security-flow__detail-label"><span data-flow-zone>{firstNode.zone}</span> decision</p>
+    <p class="security-flow__detail-title" data-flow-title>{firstNode.title}</p>
+    <p data-flow-decision>{firstNode.decision}</p>
+    <p class="security-flow__prevents"><strong>Prevents:</strong> <span data-flow-prevents>{firstNode.prevents}</span></p>
+  </div>
+
+  <nav class="security-flow__controls" aria-label={`${flow.title} controls`}>
+    <button type="button" data-flow-previous disabled>Previous</button>
+    <span data-flow-count aria-live="polite">1 of {flow.nodes.length}</span>
+    <button type="button" data-flow-next>Next</button>
+  </nav>
+</section>
+
+<script>
+  const setupSecurityFlows = () => {
+    document.querySelectorAll<HTMLElement>('[data-security-flow]:not([data-flow-ready])').forEach((root) => {
+      const nodes = [...root.querySelectorAll<HTMLButtonElement>('[data-flow-node]')];
+      const previous = root.querySelector<HTMLButtonElement>('[data-flow-previous]');
+      const next = root.querySelector<HTMLButtonElement>('[data-flow-next]');
+      const count = root.querySelector<HTMLElement>('[data-flow-count]');
+      const title = root.querySelector<HTMLElement>('[data-flow-title]');
+      const zone = root.querySelector<HTMLElement>('[data-flow-zone]');
+      const decision = root.querySelector<HTMLElement>('[data-flow-decision]');
+      const prevents = root.querySelector<HTMLElement>('[data-flow-prevents]');
+      let activeIndex = 0;
+
+      const selectNode = (index: number, moveFocus = false) => {
+        const selected = nodes[index];
+        if (!selected) return;
+        activeIndex = index;
+
+        nodes.forEach((node, nodeIndex) => {
+          node.setAttribute('aria-pressed', String(nodeIndex === activeIndex));
+        });
+
+        if (title) title.textContent = selected.dataset.title ?? '';
+        if (zone) zone.textContent = selected.dataset.zone ?? '';
+        if (decision) decision.textContent = selected.dataset.decision ?? '';
+        if (prevents) prevents.textContent = selected.dataset.prevents ?? '';
+        if (count) count.textContent = `${activeIndex + 1} of ${nodes.length}`;
+        if (previous) previous.disabled = activeIndex === 0;
+        if (next) next.disabled = activeIndex === nodes.length - 1;
+        if (moveFocus) selected.focus();
+      };
+
+      nodes.forEach((node, index) => node.addEventListener('click', () => selectNode(index)));
+      previous?.addEventListener('click', () => selectNode(Math.max(0, activeIndex - 1), true));
+      next?.addEventListener('click', () => selectNode(Math.min(nodes.length - 1, activeIndex + 1), true));
+
+      root.dataset.flowReady = 'true';
+      selectNode(0);
+    });
+  };
+
+  setupSecurityFlows();
+  document.addEventListener('astro:page-load', setupSecurityFlows);
+</script>
+
+<style>
+  .security-flow {
+    margin-block: 2rem;
+    color: var(--text);
+  }
+
+  .security-flow__header {
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .security-flow__title,
+  .security-flow__detail-title {
+    color: var(--text) !important;
+    font-family: var(--serif);
+    font-size: 1.35rem;
+    font-weight: 500;
+    line-height: 1.2;
+  }
+
+  .security-flow__summary {
+    margin-top: .35rem;
+    color: var(--muted) !important;
+    font-size: .92rem;
+  }
+
+  .security-flow__steps {
+    display: grid;
+    gap: .75rem;
+    margin-top: 1rem;
+    padding: 0 !important;
+    list-style: none;
+  }
+
+  .security-flow__step {
+    position: relative;
+    display: grid;
+    grid-template-columns: 2.5rem minmax(0, 1fr);
+    gap: .75rem;
+    align-items: start;
+    color: var(--text) !important;
+  }
+
+  .security-flow__step:not(:last-child)::after {
+    position: absolute;
+    z-index: 0;
+    top: 2.35rem;
+    bottom: -.9rem;
+    left: 1.22rem;
+    width: 1px;
+    background: var(--line);
+    content: '';
+  }
+
+  .security-flow__number {
+    position: relative;
+    z-index: 1;
+    display: grid;
+    place-items: center;
+    width: 2.5rem;
+    height: 2.5rem;
+    border: 1px solid var(--line);
+    border-radius: 50%;
+    background: var(--bg);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: .76rem;
+  }
+
+  .security-flow__node {
+    width: 100%;
+    min-height: 4.7rem;
+    padding: .85rem 1rem;
+    border: 1px solid var(--line);
+    border-radius: .35rem;
+    background: transparent;
+    color: var(--text);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .security-flow__node:hover {
+    border-color: var(--faint);
+    background: var(--surface);
+  }
+
+  .security-flow__node[aria-pressed='true'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+
+  .security-flow__node strong,
+  .security-flow__node > span:not(.security-flow__zone) {
+    display: block;
+  }
+
+  .security-flow__node strong {
+    margin-top: .18rem;
+    font-size: .98rem;
+    font-weight: 600;
+  }
+
+  .security-flow__node > span:not(.security-flow__zone) {
+    margin-top: .15rem;
+    color: var(--muted);
+    font-size: .82rem;
+    line-height: 1.45;
+  }
+
+  .security-flow__zone,
+  .security-flow__detail-label {
+    color: var(--accent) !important;
+    font-family: var(--mono);
+    font-size: .67rem;
+    letter-spacing: .08em;
+    line-height: 1.3;
+    text-transform: uppercase;
+  }
+
+  .security-flow__detail {
+    margin: 1.15rem 0 0 3.25rem;
+    padding: 1rem 1.1rem;
+    border-left: 2px solid var(--accent);
+    background: var(--surface);
+  }
+
+  .security-flow__detail-title {
+    margin-top: .3rem;
+  }
+
+  .security-flow__detail > p:not(.security-flow__detail-label, .security-flow__detail-title) {
+    margin-top: .55rem;
+    color: var(--text) !important;
+    font-size: .9rem;
+  }
+
+  .security-flow__prevents strong {
+    color: var(--text);
+  }
+
+  .security-flow__controls {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: .75rem;
+    margin-top: .8rem;
+  }
+
+  .security-flow__controls button {
+    min-height: 2.5rem;
+    padding: .45rem .75rem;
+    border: 1px solid var(--line);
+    border-radius: .3rem;
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+  }
+
+  .security-flow__controls button:hover:not(:disabled) {
+    border-color: var(--faint);
+    background: var(--surface);
+  }
+
+  .security-flow__controls button:disabled {
+    color: var(--faint);
+    cursor: default;
+  }
+
+  .security-flow__controls span {
+    min-width: 3.8rem;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: .72rem;
+    text-align: center;
+  }
+
+  @media (max-width: 32rem) {
+    .security-flow__step {
+      grid-template-columns: 2.15rem minmax(0, 1fr);
+      gap: .55rem;
+    }
+
+    .security-flow__number {
+      width: 2.15rem;
+      height: 2.15rem;
+    }
+
+    .security-flow__step:not(:last-child)::after {
+      top: 2rem;
+      left: 1.05rem;
+    }
+
+    .security-flow__node {
+      padding: .75rem .8rem;
+    }
+
+    .security-flow__detail {
+      margin-left: 2.7rem;
+    }
+
+    .security-flow__controls {
+      justify-content: space-between;
+      margin-left: 2.7rem;
+    }
+  }
+</style>

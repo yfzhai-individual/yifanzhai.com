@@ -1,0 +1,581 @@
+---
+import type { ArchitectureDiagramDefinition } from '../data/architecture-diagrams';
+
+interface Props {
+  diagram: ArchitectureDiagramDefinition;
+}
+
+const { diagram } = Astro.props;
+const initialStage = 1;
+const titleId = `${diagram.id}-title`;
+const descriptionId = `${diagram.id}-description`;
+const arrowId = `${diagram.id}-arrow`;
+const gridId = `${diagram.id}-grid`;
+const roughId = `${diagram.id}-rough`;
+const [, , viewWidth, viewHeight] = diagram.viewBox.split(' ').map(Number);
+const initialViewBox = diagram.stages[0]?.viewBox ?? diagram.viewBox;
+---
+
+<section class="service-architecture" data-architecture-diagram data-stage={initialStage}>
+  <header class="service-architecture__header">
+    <p class="service-architecture__title">{diagram.title}</p>
+    <p class="service-architecture__description">{diagram.description}</p>
+  </header>
+
+  <div class="service-architecture__stages" role="group" aria-label="Architecture layers">
+    {diagram.stages.map((stage, index) => (
+      <button
+        type="button"
+        aria-pressed={index + 1 === initialStage ? 'true' : 'false'}
+        data-stage-button={index + 1}
+        data-stage-label={stage.label}
+        data-stage-summary={stage.summary}
+        data-stage-view-box={stage.viewBox ?? diagram.viewBox}
+      >
+        <span aria-hidden="true">{index + 1}</span>
+        {stage.label}
+      </button>
+    ))}
+  </div>
+
+  <div class="service-architecture__canvas" tabindex="0" aria-label="Scrollable architecture canvas">
+    <svg
+      viewBox={initialViewBox}
+      role="img"
+      aria-labelledby={`${titleId} ${descriptionId}`}
+      data-architecture-canvas
+    >
+      <title id={titleId}>{diagram.title}</title>
+      <desc id={descriptionId}>{diagram.description} Select a component to inspect its trust decision.</desc>
+
+      <defs>
+        <marker id={arrowId} markerWidth="8" markerHeight="8" refX="7.2" refY="4" orient="auto" markerUnits="strokeWidth">
+          <path d="M 0 0 L 8 4 L 0 8 z" />
+        </marker>
+        <pattern id={gridId} width="24" height="24" patternUnits="userSpaceOnUse">
+          <path d="M 24 0 L 0 0 0 24" />
+        </pattern>
+        <filter id={roughId} x="-5%" y="-5%" width="110%" height="110%">
+          <feTurbulence type="fractalNoise" baseFrequency="0.012 0.025" numOctaves="1" seed="8" result="noise" />
+          <feDisplacementMap in="SourceGraphic" in2="noise" scale="0.75" />
+        </filter>
+      </defs>
+
+      <rect class="service-architecture__grid" width={viewWidth} height={viewHeight} fill={`url(#${gridId})`} />
+
+      {diagram.groups.map((group) => (
+        <g
+          class:list={[
+            'service-architecture__group',
+            group.tone && `service-architecture__group--${group.tone}`,
+            group.stage > initialStage && 'is-future',
+          ]}
+          data-min-stage={group.stage}
+          aria-hidden={group.stage > initialStage ? 'true' : undefined}
+        >
+          <rect x={group.x} y={group.y} width={group.width} height={group.height} rx="14" />
+          <text x={group.x + 14} y={group.y + 22}>{group.label}</text>
+        </g>
+      ))}
+
+      {diagram.edges.map((edge, index) => (
+        <g
+          class:list={[
+            'service-architecture__edge',
+            `service-architecture__edge--${edge.kind ?? 'request'}`,
+            edge.stage > initialStage && 'is-future',
+          ]}
+          data-edge
+          data-from={edge.from}
+          data-to={edge.to}
+          data-min-stage={edge.stage}
+          aria-hidden={edge.stage > initialStage ? 'true' : undefined}
+        >
+          <path class="service-architecture__edge-shadow" d={edge.path} />
+          <path id={`${diagram.id}-edge-${index}`} d={edge.path} marker-end={`url(#${arrowId})`} />
+          {edge.label && edge.labelX !== undefined && edge.labelY !== undefined && (
+            <text x={edge.labelX} y={edge.labelY} text-anchor="middle">{edge.label}</text>
+          )}
+        </g>
+      ))}
+
+      {diagram.nodes.map((node) => {
+        const titleLineHeight = 19;
+        const subtitleHeight = node.subtitle ? 20 : 0;
+        const textBlockHeight = node.title.length * titleLineHeight + subtitleHeight;
+        const titleStartY = node.y + (node.height - textBlockHeight) / 2 + 14;
+        const centerX = node.x + node.width / 2;
+        const centerY = node.y + node.height / 2;
+
+        return (
+          <g
+            class:list={[
+              'service-architecture__node',
+              `service-architecture__node--${node.kind ?? 'service'}`,
+              node.stage > initialStage && 'is-future',
+            ]}
+            transform={`rotate(${node.rotation ?? 0} ${centerX} ${centerY})`}
+            role="button"
+            tabindex={node.stage <= initialStage ? '0' : '-1'}
+            aria-label={`${node.title.join(' ')}. ${node.detail}`}
+            aria-pressed="false"
+            aria-hidden={node.stage > initialStage ? 'true' : undefined}
+            data-node
+            data-node-id={node.id}
+            data-node-title={node.title.join(' ')}
+            data-node-detail={node.detail}
+            data-node-decision={node.decision}
+            data-min-stage={node.stage}
+          >
+            {node.kind === 'queue' ? (
+              <ellipse
+                class="service-architecture__node-shape"
+                cx={centerX}
+                cy={centerY}
+                rx={node.width / 2}
+                ry={node.height / 2}
+                filter={`url(#${roughId})`}
+              />
+            ) : (
+              <rect
+                class="service-architecture__node-shape"
+                x={node.x}
+                y={node.y}
+                width={node.width}
+                height={node.height}
+                rx="12"
+                filter={`url(#${roughId})`}
+              />
+            )}
+
+            {node.kind === 'isolate' && (
+              <rect
+                class="service-architecture__node-double"
+                x={node.x + 5}
+                y={node.y + 5}
+                width={node.width - 10}
+                height={node.height - 10}
+                rx="9"
+              />
+            )}
+
+            {node.kind === 'store' && (
+              <path
+                class="service-architecture__store-line"
+                d={`M ${node.x + 12} ${node.y + 13} C ${node.x + node.width * .35} ${node.y + 18}, ${node.x + node.width * .65} ${node.y + 8}, ${node.x + node.width - 12} ${node.y + 13}`}
+              />
+            )}
+
+            <text class="service-architecture__node-title" text-anchor="middle">
+              {node.title.map((line, index) => (
+                <tspan x={centerX} y={titleStartY + index * titleLineHeight}>{line}</tspan>
+              ))}
+            </text>
+            {node.subtitle && (
+              <text
+                class="service-architecture__node-subtitle"
+                x={centerX}
+                y={titleStartY + node.title.length * titleLineHeight + 2}
+                text-anchor="middle"
+              >
+                {node.subtitle}
+              </text>
+            )}
+          </g>
+        );
+      })}
+    </svg>
+  </div>
+
+  <div class="service-architecture__detail" aria-live="polite">
+    <p class="service-architecture__detail-label" data-detail-label>{diagram.stages[0].label}</p>
+    <p class="service-architecture__detail-body" data-detail-body>{diagram.stages[0].summary}</p>
+    <p class="service-architecture__detail-decision" data-detail-decision hidden>
+      <strong>Security decision:</strong> <span></span>
+    </p>
+  </div>
+</section>
+
+<script>
+  const setupArchitectureDiagrams = () => {
+    document.querySelectorAll<HTMLElement>('[data-architecture-diagram]:not([data-diagram-ready])').forEach((root) => {
+      const stages = [...root.querySelectorAll<HTMLButtonElement>('[data-stage-button]')];
+      const layeredElements = [...root.querySelectorAll<Element>('[data-min-stage]')];
+      const nodes = [...root.querySelectorAll<SVGGElement>('[data-node]')];
+      const edges = [...root.querySelectorAll<SVGGElement>('[data-edge]')];
+      const canvas = root.querySelector<SVGSVGElement>('[data-architecture-canvas]');
+      const detailLabel = root.querySelector<HTMLElement>('[data-detail-label]');
+      const detailBody = root.querySelector<HTMLElement>('[data-detail-body]');
+      const detailDecision = root.querySelector<HTMLElement>('[data-detail-decision]');
+      const detailDecisionText = detailDecision?.querySelector<HTMLSpanElement>('span');
+      const stageDefinitions = [
+        ...root.querySelectorAll<HTMLButtonElement>('[data-stage-button]'),
+      ].map((button) => ({
+        label: button.dataset.stageLabel ?? '',
+        summary: button.dataset.stageSummary ?? '',
+        viewBox: button.dataset.stageViewBox ?? '',
+      }));
+
+      let activeStage = 1;
+
+      const clearSelection = () => {
+        nodes.forEach((node) => {
+          node.classList.remove('is-selected', 'is-connected', 'is-dimmed');
+          node.setAttribute('aria-pressed', 'false');
+        });
+        edges.forEach((edge) => edge.classList.remove('is-connected', 'is-dimmed'));
+
+        const stage = stageDefinitions[activeStage - 1];
+        if (canvas && stage?.viewBox) canvas.setAttribute('viewBox', stage.viewBox);
+        if (detailLabel) detailLabel.textContent = stage?.label ?? '';
+        if (detailBody) detailBody.textContent = stage?.summary ?? '';
+        if (detailDecision) detailDecision.hidden = true;
+      };
+
+      const selectNode = (selected: SVGGElement) => {
+        if (selected.classList.contains('is-future')) return;
+        const selectedId = selected.dataset.nodeId ?? '';
+        const connectedIds = new Set([selectedId]);
+
+        edges.forEach((edge) => {
+          const connected = edge.dataset.from === selectedId || edge.dataset.to === selectedId;
+          edge.classList.toggle('is-connected', connected);
+          edge.classList.toggle('is-dimmed', !connected && !edge.classList.contains('is-future'));
+          if (connected) {
+            if (edge.dataset.from) connectedIds.add(edge.dataset.from);
+            if (edge.dataset.to) connectedIds.add(edge.dataset.to);
+          }
+        });
+
+        nodes.forEach((node) => {
+          const nodeId = node.dataset.nodeId ?? '';
+          const isSelected = nodeId === selectedId;
+          node.classList.toggle('is-selected', isSelected);
+          node.classList.toggle('is-connected', !isSelected && connectedIds.has(nodeId));
+          node.classList.toggle('is-dimmed', !connectedIds.has(nodeId) && !node.classList.contains('is-future'));
+          node.setAttribute('aria-pressed', String(isSelected));
+        });
+
+        if (detailLabel) detailLabel.textContent = selected.dataset.nodeTitle ?? '';
+        if (detailBody) detailBody.textContent = selected.dataset.nodeDetail ?? '';
+        if (detailDecisionText) detailDecisionText.textContent = selected.dataset.nodeDecision ?? '';
+        if (detailDecision) detailDecision.hidden = false;
+      };
+
+      const setStage = (stage: number) => {
+        activeStage = stage;
+        root.dataset.stage = String(stage);
+
+        stages.forEach((button) => {
+          button.setAttribute('aria-pressed', String(Number(button.dataset.stageButton) === stage));
+        });
+
+        layeredElements.forEach((element) => {
+          const isFuture = Number((element as HTMLElement).dataset.minStage) > stage;
+          element.classList.toggle('is-future', isFuture);
+          element.setAttribute('aria-hidden', String(isFuture));
+        });
+
+        nodes.forEach((node) => {
+          node.setAttribute('tabindex', node.classList.contains('is-future') ? '-1' : '0');
+        });
+
+        clearSelection();
+      };
+
+      stages.forEach((button) => {
+        button.addEventListener('click', () => setStage(Number(button.dataset.stageButton)));
+      });
+
+      nodes.forEach((node) => {
+        node.addEventListener('click', (event) => {
+          event.stopPropagation();
+          selectNode(node);
+        });
+        node.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            selectNode(node);
+          }
+        });
+      });
+
+      canvas?.addEventListener('click', () => clearSelection());
+      root.dataset.diagramReady = 'true';
+      setStage(1);
+    });
+  };
+
+  setupArchitectureDiagrams();
+  document.addEventListener('astro:page-load', setupArchitectureDiagrams);
+</script>
+
+<style>
+  .service-architecture {
+    margin-block: 2rem;
+    color: var(--text);
+  }
+
+  .service-architecture__header {
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .service-architecture__title {
+    color: var(--text) !important;
+    font-family: var(--serif);
+    font-size: 1.35rem;
+    font-weight: 500;
+    line-height: 1.2;
+  }
+
+  .service-architecture__description {
+    margin-top: .35rem;
+    color: var(--muted) !important;
+    font-size: .92rem;
+  }
+
+  .service-architecture__stages {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem;
+    margin-top: 1rem;
+  }
+
+  .service-architecture__stages button {
+    display: inline-flex;
+    min-height: 2.5rem;
+    align-items: center;
+    gap: .45rem;
+    padding: .45rem .7rem;
+    border: 1px solid var(--line);
+    border-radius: .3rem;
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+  }
+
+  .service-architecture__stages button span {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: .7rem;
+  }
+
+  .service-architecture__stages button:hover {
+    border-color: var(--faint);
+    background: var(--surface);
+  }
+
+  .service-architecture__stages button[aria-pressed='true'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+
+  .service-architecture__canvas {
+    margin-top: 1rem;
+    overflow-x: auto;
+    border: 1px solid var(--line);
+    border-radius: .35rem;
+    background: color-mix(in srgb, var(--bg) 92%, var(--surface));
+    overscroll-behavior-inline: contain;
+  }
+
+  .service-architecture__canvas svg {
+    display: block;
+    width: 100%;
+    min-width: 44rem;
+    height: auto;
+    color: var(--text);
+  }
+
+  .service-architecture__grid {
+    fill: transparent;
+  }
+
+  .service-architecture__grid + * {
+    isolation: isolate;
+  }
+
+  .service-architecture :global(pattern path) {
+    fill: none;
+    stroke: var(--line);
+    stroke-width: .55;
+    opacity: .35;
+  }
+
+  .service-architecture :global(marker path) {
+    fill: var(--muted);
+    stroke: none;
+  }
+
+  .service-architecture__group {
+    transition: opacity 180ms ease;
+  }
+
+  .service-architecture__group rect {
+    fill: transparent;
+    stroke: var(--line);
+    stroke-width: 1.5;
+    stroke-dasharray: 8 7;
+  }
+
+  .service-architecture__group text {
+    fill: var(--muted);
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+
+  .service-architecture__group--risk rect {
+    stroke: var(--accent);
+  }
+
+  .service-architecture__group--risk text,
+  .service-architecture__group--security text {
+    fill: var(--accent);
+  }
+
+  .service-architecture__edge {
+    color: var(--muted);
+    transition: opacity 180ms ease;
+  }
+
+  .service-architecture__edge path {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .service-architecture__edge .service-architecture__edge-shadow {
+    transform: translate(.7px, -.6px);
+    opacity: .3;
+  }
+
+  .service-architecture__edge--data path {
+    stroke-dasharray: 7 5;
+  }
+
+  .service-architecture__edge--security {
+    color: var(--accent);
+  }
+
+  .service-architecture__edge text {
+    fill: var(--muted);
+    stroke: var(--bg);
+    stroke-width: 5px;
+    paint-order: stroke;
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+
+  .service-architecture__node {
+    color: var(--text);
+    cursor: pointer;
+    transition: opacity 180ms ease;
+  }
+
+  .service-architecture__node-shape {
+    fill: var(--bg);
+    stroke: currentColor;
+    stroke-width: 2.2;
+  }
+
+  .service-architecture__node-double,
+  .service-architecture__store-line {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.1;
+    opacity: .6;
+  }
+
+  .service-architecture__node-title {
+    fill: var(--text);
+    font-family: "Bradley Hand", "Segoe Print", "Comic Sans MS", var(--sans);
+    font-size: 18px;
+    font-weight: 500;
+    pointer-events: none;
+  }
+
+  .service-architecture__node-subtitle {
+    fill: var(--muted);
+    font-family: var(--mono);
+    font-size: 12px;
+    pointer-events: none;
+  }
+
+  .service-architecture__node:hover,
+  .service-architecture__node:focus-visible,
+  .service-architecture__node.is-selected {
+    color: var(--accent);
+    outline: none;
+  }
+
+  .service-architecture__node:hover .service-architecture__node-shape,
+  .service-architecture__node:focus-visible .service-architecture__node-shape,
+  .service-architecture__node.is-selected .service-architecture__node-shape {
+    fill: var(--accent-soft);
+  }
+
+  .service-architecture__node:focus-visible .service-architecture__node-shape {
+    stroke-width: 4;
+  }
+
+  .service-architecture__node.is-connected .service-architecture__node-shape {
+    stroke: var(--accent);
+  }
+
+  .service-architecture__edge.is-connected {
+    color: var(--accent);
+    opacity: 1;
+  }
+
+  .service-architecture__node.is-dimmed,
+  .service-architecture__edge.is-dimmed {
+    opacity: .16;
+  }
+
+  .service-architecture .is-future {
+    display: none;
+  }
+
+  .service-architecture__detail {
+    min-height: 7.25rem;
+    margin-top: 1rem;
+    padding: 1rem 1.1rem;
+    border-left: 2px solid var(--accent);
+    background: var(--surface);
+  }
+
+  .service-architecture__detail-label {
+    color: var(--accent) !important;
+    font-family: var(--mono);
+    font-size: .67rem;
+    letter-spacing: .08em;
+    line-height: 1.3;
+    text-transform: uppercase;
+  }
+
+  .service-architecture__detail-body,
+  .service-architecture__detail-decision {
+    margin-top: .5rem;
+    color: var(--text) !important;
+    font-size: .9rem;
+  }
+
+  .service-architecture__detail-decision strong {
+    color: var(--text);
+  }
+
+  @media (max-width: 48rem) {
+    .service-architecture__canvas {
+      margin-inline: calc(var(--pad) * -.25);
+    }
+
+    .service-architecture__canvas svg {
+      min-width: 43rem;
+    }
+  }
+</style>

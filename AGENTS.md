@@ -15,6 +15,7 @@ This is Yifan Zhai's personal technical website. It holds technical notes, secur
 - Keep technical writing in the existing Astro `writing` content collection.
 - Before creating an article, inspect `src/content.config.ts`, `src/content/writing/_template.mdx`, and nearby content.
 - Follow existing frontmatter and MDX conventions. Use an evergreen, lowercase kebab-case filename for the URL slug and default new work to `draft: true`.
+- While a draft is actively being prepared, keep `publishedAt` set to the current local calendar date. Before publication, confirm the intended publication date. When revising an already-published article, preserve `publishedAt` and set or update `updatedAt` to the current local calendar date instead.
 - Reuse existing layouts and components. Avoid application-code changes unless the content requires them.
 - Never publish an article or change `draft` to `false` unless explicitly requested.
 
