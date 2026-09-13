@@ -1,0 +1,424 @@
+---
+interface Actor {
+  title: string;
+  subtitle: string;
+}
+
+interface FlowStep {
+  from: number;
+  to: number;
+  label: string;
+  kind?: 'request' | 'response' | 'token' | 'api';
+}
+
+interface FlowDefinition {
+  id: 'oauth' | 'oidc';
+  tab: string;
+  title: string;
+  summary: string;
+  resultLabel: string;
+  result: string;
+  actors: Actor[];
+  steps: FlowStep[];
+}
+
+const flows: FlowDefinition[] = [
+  {
+    id: 'oauth',
+    tab: 'OAuth 2.0 · Connect Drive',
+    title: 'Authorize access to Google Drive',
+    summary: 'The user delegates a narrow Google API permission to your application.',
+    resultLabel: 'Result: delegated API access',
+    result: 'The access token is sent to Google Drive and carries the granted Drive scopes. It is not your application’s login credential.',
+    actors: [
+      { title: 'User', subtitle: 'resource owner' },
+      { title: 'Your app', subtitle: 'OAuth client' },
+      { title: 'Google OAuth', subtitle: 'authorization server' },
+      { title: 'Drive API', subtitle: 'resource server' },
+    ],
+    steps: [
+      { from: 0, to: 1, label: 'Connect Drive' },
+      { from: 1, to: 2, label: 'Redirect: Drive scope + state' },
+      { from: 0, to: 2, label: 'Authenticate + approve Drive scope' },
+      { from: 2, to: 1, label: 'Authorization code + state', kind: 'response' },
+      { from: 1, to: 2, label: 'Exchange code', kind: 'request' },
+      { from: 2, to: 1, label: 'Access token (+ optional refresh)', kind: 'token' },
+      { from: 1, to: 3, label: 'List files with access token', kind: 'api' },
+      { from: 3, to: 1, label: 'Return file metadata', kind: 'response' },
+    ],
+  },
+  {
+    id: 'oidc',
+    tab: 'OIDC · Sign in with Google',
+    title: 'Authenticate with Google, then create an app session',
+    summary: 'Google asserts an identity to your backend; your application still owns its account and session.',
+    resultLabel: 'Result: application login',
+    result: 'Your backend validates the ID token, maps its issuer and subject to a local account, applies local policy, and issues its own session cookie.',
+    actors: [
+      { title: 'User', subtitle: 'signing in' },
+      { title: 'Browser', subtitle: 'front channel' },
+      { title: 'Your backend', subtitle: 'OIDC client' },
+      { title: 'Google Identity', subtitle: 'OpenID provider' },
+    ],
+    steps: [
+      { from: 0, to: 1, label: 'Sign in with Google' },
+      { from: 1, to: 2, label: 'Begin OIDC login' },
+      { from: 2, to: 3, label: 'Redirect: openid + state' },
+      { from: 0, to: 3, label: 'Authenticate at Google' },
+      { from: 3, to: 2, label: 'Authorization code + state', kind: 'response' },
+      { from: 2, to: 3, label: 'Exchange code', kind: 'request' },
+      { from: 3, to: 2, label: 'ID token + access token', kind: 'token' },
+      { from: 2, to: 2, label: 'Validate ID token', kind: 'token' },
+      { from: 2, to: 2, label: 'Load local account (iss + sub)', kind: 'api' },
+      { from: 2, to: 1, label: 'Create application session', kind: 'response' },
+    ],
+  },
+];
+
+const componentId = 'google-oauth-oidc-flow';
+const actorCenters = [85, 275, 465, 655];
+const actorWidth = 142;
+const actorY = 18;
+const actorHeight = 60;
+const firstStepY = 126;
+const stepGap = 46;
+const markerId = `${componentId}-arrow`;
+---
+
+<section id={componentId} class="oauth-oidc-flow" data-oauth-oidc-flow>
+  <header class="oauth-oidc-flow__header">
+    <p class="oauth-oidc-flow__title">Google can authorize access or authenticate a user</p>
+    <p class="oauth-oidc-flow__description">The code flow looks similar. The token recipient and security outcome are different.</p>
+  </header>
+
+  <div class="oauth-oidc-flow__tabs" role="group" aria-label="Select a flow">
+    {flows.map((flow, index) => (
+      <button
+        type="button"
+        aria-pressed={index === 0 ? 'true' : 'false'}
+        aria-controls={`${componentId}-${flow.id}`}
+        data-flow-button={flow.id}
+      >
+        <span aria-hidden="true">{index + 1}</span>
+        {flow.tab}
+      </button>
+    ))}
+  </div>
+
+  <div class="oauth-oidc-flow__canvas" tabindex="0" aria-label="Scrollable authorization and authentication sequence diagram">
+    <svg viewBox="0 0 740 610" role="img" aria-labelledby={`${componentId}-title ${componentId}-description`}>
+      <title id={`${componentId}-title`}>OAuth authorization compared with OpenID Connect authentication</title>
+      <desc id={`${componentId}-description`}>Select a flow to compare the same authorization-code mechanics with different token recipients and outcomes.</desc>
+
+      <defs>
+        <marker id={markerId} markerWidth="8" markerHeight="8" refX="7.2" refY="4" orient="auto" markerUnits="strokeWidth">
+          <path d="M 0 0 L 8 4 L 0 8 z" />
+        </marker>
+      </defs>
+
+      {flows.map((flow, flowIndex) => (
+        <g
+          id={`${componentId}-${flow.id}`}
+          class:list={['oauth-oidc-flow__panel', flowIndex === 0 && 'is-active']}
+          data-flow-panel={flow.id}
+          aria-hidden={flowIndex === 0 ? 'false' : 'true'}
+        >
+          {flow.actors.map((actor, actorIndex) => {
+            const centerX = actorCenters[actorIndex];
+            return (
+              <g class="oauth-oidc-flow__actor">
+                <rect x={centerX - actorWidth / 2} y={actorY} width={actorWidth} height={actorHeight} rx="10" />
+                <text class="oauth-oidc-flow__actor-title" x={centerX} y={actorY + 25} text-anchor="middle">{actor.title}</text>
+                <text class="oauth-oidc-flow__actor-subtitle" x={centerX} y={actorY + 44} text-anchor="middle">{actor.subtitle}</text>
+                <line x1={centerX} y1={actorY + actorHeight} x2={centerX} y2="582" />
+              </g>
+            );
+          })}
+
+          {flow.steps.map((step, stepIndex) => {
+            const y = firstStepY + stepIndex * stepGap;
+            const fromX = actorCenters[step.from];
+            const toX = actorCenters[step.to];
+            const selfDirected = step.from === step.to;
+            const labelWidth = Math.max(84, Math.min(224, step.label.length * 6.15 + 18));
+            const labelX = selfDirected ? fromX - labelWidth / 2 - 20 : (fromX + toX) / 2;
+            const labelY = selfDirected ? y + 8 : y - 10;
+            const path = selfDirected
+              ? `M ${fromX} ${y} C ${fromX + 58} ${y}, ${fromX + 58} ${y + 28}, ${fromX} ${y + 28}`
+              : `M ${fromX} ${y} L ${toX} ${y}`;
+
+            return (
+              <g class:list={['oauth-oidc-flow__step', `oauth-oidc-flow__step--${step.kind ?? 'request'}`]}>
+                <path d={path} marker-end={`url(#${markerId})`} />
+                <circle cx={fromX} cy={y} r="12" />
+                <text class="oauth-oidc-flow__step-number" x={fromX} y={y + 4} text-anchor="middle">{stepIndex + 1}</text>
+                <g class="oauth-oidc-flow__step-label" transform={`translate(${labelX} ${labelY})`}>
+                  <rect x={-labelWidth / 2} y="-12" width={labelWidth} height="20" rx="4" />
+                  <text x="0" y="2" text-anchor="middle">{step.label}</text>
+                </g>
+              </g>
+            );
+          })}
+        </g>
+      ))}
+    </svg>
+  </div>
+
+  {flows.map((flow, index) => (
+    <div class="oauth-oidc-flow__result" data-flow-result={flow.id} hidden={index !== 0} aria-live="polite">
+      <p class="oauth-oidc-flow__result-label">{flow.resultLabel}</p>
+      <p>{flow.result}</p>
+    </div>
+  ))}
+
+  {flows.map((flow, index) => (
+    <div class="oauth-oidc-flow__accessible" data-flow-accessible={flow.id} hidden={index !== 0}>
+      <p>{flow.title}. {flow.summary}</p>
+      <ol>
+        {flow.steps.map((step) => <li>{flow.actors[step.from].title} to {flow.actors[step.to].title}: {step.label}.</li>)}
+      </ol>
+    </div>
+  ))}
+</section>
+
+<script>
+  const setupOAuthOidcFlows = () => {
+    document.querySelectorAll<HTMLElement>('[data-oauth-oidc-flow]:not([data-flow-ready])').forEach((root) => {
+      const buttons = [...root.querySelectorAll<HTMLButtonElement>('[data-flow-button]')];
+      const panels = [...root.querySelectorAll<SVGGElement>('[data-flow-panel]')];
+      const results = [...root.querySelectorAll<HTMLElement>('[data-flow-result]')];
+      const accessible = [...root.querySelectorAll<HTMLElement>('[data-flow-accessible]')];
+
+      const selectFlow = (flowId: string) => {
+        buttons.forEach((button) => button.setAttribute('aria-pressed', String(button.dataset.flowButton === flowId)));
+        panels.forEach((panel) => {
+          const active = panel.dataset.flowPanel === flowId;
+          panel.classList.toggle('is-active', active);
+          panel.setAttribute('aria-hidden', String(!active));
+        });
+        results.forEach((result) => { result.hidden = result.dataset.flowResult !== flowId; });
+        accessible.forEach((description) => { description.hidden = description.dataset.flowAccessible !== flowId; });
+      };
+
+      buttons.forEach((button) => button.addEventListener('click', () => selectFlow(button.dataset.flowButton ?? 'oauth')));
+      root.dataset.flowReady = 'true';
+    });
+  };
+
+  setupOAuthOidcFlows();
+  document.addEventListener('astro:page-load', setupOAuthOidcFlows);
+</script>
+
+<style>
+  .oauth-oidc-flow {
+    margin-block: 2rem;
+    color: var(--text);
+  }
+
+  .oauth-oidc-flow__header {
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .oauth-oidc-flow__title {
+    color: var(--text) !important;
+    font-family: var(--serif);
+    font-size: 1.35rem;
+    font-weight: 500;
+    line-height: 1.2;
+  }
+
+  .oauth-oidc-flow__description {
+    margin-top: .35rem;
+    color: var(--muted) !important;
+    font-size: .92rem;
+  }
+
+  .oauth-oidc-flow__tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .55rem;
+    margin-block: 1rem;
+  }
+
+  .oauth-oidc-flow__tabs button {
+    display: inline-flex;
+    gap: .5rem;
+    align-items: center;
+    min-height: 2.35rem;
+    padding: .48rem .72rem;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--muted);
+    font: 600 .72rem/1.2 var(--mono);
+    cursor: pointer;
+    transition: border-color 160ms ease, background 160ms ease, color 160ms ease;
+  }
+
+  .oauth-oidc-flow__tabs button span {
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .oauth-oidc-flow__tabs button:hover {
+    border-color: var(--faint);
+    color: var(--text);
+  }
+
+  .oauth-oidc-flow__tabs button[aria-pressed='true'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--text);
+  }
+
+  .oauth-oidc-flow__tabs button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .oauth-oidc-flow__canvas {
+    overflow-x: auto;
+    border-block: 1px solid var(--line);
+    background: color-mix(in srgb, var(--surface) 55%, transparent);
+    scrollbar-color: var(--faint) transparent;
+  }
+
+  .oauth-oidc-flow__canvas:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .oauth-oidc-flow__canvas svg {
+    display: block;
+    width: 100%;
+    min-width: 680px;
+    height: auto;
+  }
+
+  .oauth-oidc-flow__panel {
+    display: none;
+  }
+
+  .oauth-oidc-flow__panel.is-active {
+    display: block;
+  }
+
+  .oauth-oidc-flow__actor rect {
+    fill: var(--bg);
+    stroke: var(--line);
+    stroke-width: 1.2;
+  }
+
+  .oauth-oidc-flow__actor line {
+    stroke: var(--line);
+    stroke-width: 1;
+    stroke-dasharray: 4 7;
+  }
+
+  .oauth-oidc-flow__actor-title {
+    fill: var(--text);
+    font-family: var(--serif);
+    font-size: 16px;
+    font-weight: 500;
+  }
+
+  .oauth-oidc-flow__actor-subtitle {
+    fill: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: .03em;
+  }
+
+  .oauth-oidc-flow__step path {
+    fill: none;
+    stroke: var(--faint);
+    stroke-width: 1.45;
+  }
+
+  .oauth-oidc-flow__step--response path {
+    stroke-dasharray: 5 4;
+  }
+
+  .oauth-oidc-flow__step--token path,
+  .oauth-oidc-flow__step--api path {
+    stroke: var(--accent);
+  }
+
+  .oauth-oidc-flow__step circle {
+    fill: var(--bg);
+    stroke: var(--accent);
+    stroke-width: 1.5;
+  }
+
+  .oauth-oidc-flow__step-number {
+    fill: var(--accent);
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+  }
+
+  .oauth-oidc-flow__step-label rect {
+    fill: var(--bg);
+  }
+
+  .oauth-oidc-flow__step-label text {
+    fill: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+
+  .oauth-oidc-flow :global(marker path) {
+    fill: var(--faint);
+  }
+
+  .oauth-oidc-flow__result {
+    margin-top: 1rem;
+    padding: 1rem 1.1rem;
+    border-left: 2px solid var(--accent);
+    background: var(--surface);
+  }
+
+  .oauth-oidc-flow__result[hidden],
+  .oauth-oidc-flow [hidden] {
+    display: none;
+  }
+
+  .oauth-oidc-flow__result-label {
+    margin-bottom: .35rem;
+    color: var(--accent) !important;
+    font-family: var(--mono);
+    font-size: .68rem;
+    font-weight: 650;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+
+  .oauth-oidc-flow__result p:last-child {
+    color: var(--text) !important;
+    font-size: .9rem;
+  }
+
+  .oauth-oidc-flow__accessible:not([hidden]) {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  @media (max-width: 42rem) {
+    .oauth-oidc-flow__tabs {
+      display: grid;
+    }
+
+    .oauth-oidc-flow__tabs button {
+      justify-content: flex-start;
+      border-radius: .3rem;
+    }
+  }
+</style>

@@ -1,0 +1,929 @@
+---
+title: "How Modern Web Authentication Fits Together"
+description: "A start-to-finish guide to passwords, passkeys, sessions, JWTs, OAuth, OIDC, SSO, browser token storage, and the security tradeoffs interviewers expect you to explain."
+publishedAt: 2026-09-12
+tags: [security, authentication, OAuth, web]
+draft: false
+---
+
+import Callout from '../../components/Callout.astro';
+import MobileAuthFlowDiagram from '../../components/MobileAuthFlowDiagram.astro';
+import OAuthOidcFlowDiagram from '../../components/OAuthOidcFlowDiagram.astro';
+import ServiceArchitectureDiagram from '../../components/ServiceArchitectureDiagram.astro';
+import { browserTokenArchitecture, ssoArchitecture } from '../../data/architecture-diagrams';
+
+Web authentication is easier to understand as one continuous story:
+
+1. A person proves an identity with a password, passkey, or external identity provider.
+2. The application turns that short authentication event into an ongoing session.
+3. When separate application programming interfaces (APIs) enter the picture, scoped access and refresh tokens carry delegated authority across boundaries.
+4. Federation and Single Sign-On (SSO) let several applications rely on one identity provider without sharing the user's password—or one universal application session.
+
+Each layer introduces a different credential. Confusion starts when we compare credentials that answer different questions: a session cookie, a JSON Web Token (JWT), an OAuth access token, and an OpenID Connect (OIDC) ID token are neither synonyms nor mutually exclusive choices.
+
+For any credential, separate three decisions:
+
+1. **Purpose:** continue an application session, call an application programming interface (API), renew API access, or describe a login.
+2. **Format:** an opaque random value or a self-contained claims object such as a JWT.
+3. **Transport:** an automatically attached cookie or an explicitly added `Authorization` header.
+
+A modern web application may use several credentials at different trust boundaries. The useful question is not, “Which token is best?” It is:
+
+> Which component needs authority to call which system, for how long, and what should happen when that credential is stolen, replayed, or revoked?
+
+This article stays focused on **authentication and credential handling**. Authorization—roles, relationships, attributes, and resource-level policy—deserves its own article. We will mention it only where accepting a token could otherwise be mistaken for permission to access a resource.
+
+## Before tokens: prove the identity
+
+**Identification** is a claim such as “I am user 123.” **Authentication** verifies that claim using an **authenticator**: something the user knows, has, or is. A password is something the user knows. A security key or phone holding a private key is something the user has. A biometric is commonly described as something the user is; in a modern passkey system, it normally unlocks a device-held key, and a well-designed server does not receive the raw fingerprint or face scan.
+
+Successful authentication should be a brief event. The application verifies the authenticator, then issues a replaceable session credential. It should not make the user resend the primary authenticator on every page request.
+
+### HTTP Basic: Base64 is packaging, not protection
+
+HTTP Basic authentication sends a username and password with a request:
+
+```http
+Authorization: Basic YWxpY2U6Y29ycmVjdC1ob3JzZS1iYXR0ZXJ5LXN0YXBsZQ==
+```
+
+The characters after `Basic` are `username:password` encoded with **Base64**. Base64 represents bytes as printable text; anyone can reverse it without a key. It is not hashing and it is not encryption.
+
+[RFC 7617](https://www.rfc-editor.org/rfc/rfc7617.html) therefore treats Basic credentials as cleartext unless the connection is protected. Use it only over HTTPS—HTTP protected by [Transport Layer Security (TLS)](https://yifanzhai.com/writing/how-tls-encrypts-http/)—and only when repeatedly sending a reusable password is acceptable, such as in a tightly controlled legacy integration. It is a poor default for a consumer login because browsers and clients may cache the credential, logout is awkward, and every authenticated request handles the password again.
+
+### HTTP Digest: challenge-response, but still a legacy choice
+
+HTTP Digest authentication was designed to avoid sending the literal password. The server supplies a **nonce**—a value intended to make the challenge fresh—and the client returns a digest calculated from the username, password, nonce, HTTP method, and requested URI. The password itself does not cross the network in cleartext.
+
+That does not make Digest a modern replacement for TLS. [RFC 7616](https://www.rfc-editor.org/rfc/rfc7616.html) documents downgrade, chosen-plaintext, and offline-dictionary risks; compatibility can also preserve weak algorithms. Server-side Digest material may become a password-equivalent secret. Digest still needs HTTPS, has limited application support, and is rarely the right choice for a new web application.
+
+### Modern password login: TLS in transit, a password KDF at rest
+
+A normal web login takes a simpler route:
+
+1. The browser sends the password once to the application's login endpoint over HTTPS.
+2. Transport Layer Security (TLS) authenticates the server and protects the connection.
+3. The server runs a deliberately expensive password **key derivation function (KDF)** with the user's unique random salt and compares the result with the stored verifier.
+4. On success, the server creates a session and the password leaves the request path.
+
+A typical certificate-authenticated TLS 1.3 connection uses public-key operations during its authenticated key exchange, then derives short-lived symmetric traffic keys that protect application data with authenticated encryption ([RFC 8446](https://www.rfc-editor.org/rfc/rfc8446.html)). This is where asymmetric cryptography helps a password login: the browser relies on the HTTPS connection instead of inventing its own password-encryption scheme.
+
+The server should not encrypt passwords for later recovery. Encryption is reversible; password verification does not need the original value. Use a password-specific, salted, tunably expensive KDF. OWASP's [Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) currently prefers Argon2id for new systems, with scrypt as a fallback and carefully configured bcrypt or PBKDF2 for particular compatibility or compliance needs. A fast general-purpose hash such as SHA-256 is designed to be cheap, which also makes large-scale guessing cheap.
+
+<Callout type="info" title="Did you know?">A password salt is not secret: store the unique random salt beside the hash—modern formats usually include it in the encoded value. A **pepper** is an optional server-held secret added to password verification and kept outside the password database in a secrets manager or Hardware Security Module (HSM).</Callout>
+
+| Tool | Property | Correct role in authentication | Common mistake |
+| --- | --- | --- | --- |
+| Base64 | Reversible encoding, no secret key | Move binary or awkward bytes through text protocols | Calling it encryption |
+| General hash | One-way fixed-size digest | Integrity, fingerprints, and parts of cryptographic protocols | Using a fast hash alone for password storage |
+| Password KDF | Salted, slow, and often memory-hard | Store a verifier that makes offline guessing expensive | Encrypting recoverable passwords instead |
+| Asymmetric cryptography | Public/private key pair | TLS server authentication, passkeys, signatures, sender proof | Writing custom client-side password encryption |
+| Symmetric authenticated encryption | Shared secret key; fast confidentiality and integrity | Protect TLS traffic and encrypted application data | Confusing transport encryption with safe endpoint storage |
+
+<Callout type="warning" title="Do not hash the password in browser code as a substitute for HTTPS">
+If the server accepts a stable client-side hash as the login secret, that hash becomes a password equivalent: an attacker can replay it without knowing the original password. Custom browser encryption has a similar key-distribution problem and does not replace an authenticated TLS channel. Use a mature authentication protocol over HTTPS, then protect the server-side password verifier.
+</Callout>
+
+Password security also depends on the surrounding system: accept long passwords, reject common and compromised choices, rate-limit guesses, avoid arbitrary periodic resets, protect recovery, and offer Multi-Factor Authentication (MFA). Current [NIST SP 800-63B-4](https://pages.nist.gov/800-63-4/sp800-63b.html) treats passwords as neither replay-resistant nor phishing-resistant and requires rate limiting and blocklisting for password verifiers in its scope.
+
+### Passkeys: asymmetric authentication without a shared password
+
+A **passkey** is a user-friendly deployment of Fast Identity Online (FIDO) credentials, normally exposed to web applications through **Web Authentication (WebAuthn)**. At registration, an authenticator creates a key pair scoped to the Relying Party (RP). The server stores the public key; the private key remains protected by the authenticator and may be unlocked locally with a device PIN or biometric.
+
+#### What exactly is the authenticator?
+
+An **authenticator** is the hardware or software security component that creates or obtains the passkey's private key and uses it to sign challenges after user approval. It is not necessarily an online application or one particular local trust store. The website asks the browser or operating system through WebAuthn; that client finds an eligible authenticator and returns only a public key during registration or a signed assertion during login. Website JavaScript never receives the private key.
+
+Authenticators commonly have one of two attachment modes:
+
+- A **platform authenticator** is built into the current phone or computer—for example, an Apple device using Face ID or Touch ID, Android using its screen lock and credential provider, or Windows Hello.
+- A **roaming authenticator** is reached across devices or carried separately—for example, a hardware security key over Universal Serial Bus (USB), Near Field Communication (NFC), or Bluetooth Low Energy (BLE), or a nearby phone used to approve login on a laptop.
+
+A separate question is whether the credential is **device-bound** or **syncable**. A device-bound credential remains with one authenticator. A syncable passkey provider—such as iCloud Keychain, Google Password Manager, or another credential manager—can make a protected copy available to the user's other devices. The exact storage may therefore be local hardware, operating-system-protected software, an external security key, or a protected synchronization system. In every case, the RP receives the public key and signed proof, not the reusable private key.
+
+The device PIN, fingerprint, or face scan performs **user verification** locally: it authorizes the authenticator to use the private key. The biometric is not sent to the website. This is also not the browser's Certificate Authority (CA) trust store; the RP stores the account's credential ID and public key, while the browser and authenticator enforce the expected RP domain.
+
+At login, the server sends a fresh challenge. The authenticator signs it after user approval, and the server verifies the signature. The private key and biometric do not go to the server. Because the credential is scoped to the relying party's domain and every response covers a fresh challenge, properly implemented WebAuthn is resistant to phishing and replay in ways a reusable password is not. The [W3C WebAuthn specification](https://www.w3.org/TR/webauthn-3/) defines the registration and authentication ceremonies.
+
+Passwords and passkeys answer **how the user authenticates**. They do not keep an HTTP application signed in forever. After either succeeds, the application still creates a session or participates in a federation protocol.
+
+### API keys usually identify software, not a human login
+
+An **API key** is commonly a static bearer secret that identifies a calling application, project, or developer account for quota, billing, or coarse access control. It usually does not prove which human is using that application. Google Cloud makes this distinction explicit in its [API-key guidance](https://docs.cloud.google.com/endpoints/docs/openapi/when-why-api-key): API keys identify the calling project, while user authentication needs a user credential.
+
+Treat API keys like secrets: restrict them to the intended APIs and environments, keep them out of browser bundles and source control when they grant sensitive authority, rotate them, and monitor their use. Prefer short-lived workload identity credentials over long-lived keys for server-to-server systems when the platform supports them.
+
+The transition to tokens is now clear: **authenticate once with the strongest primary credential the risk requires, then exchange that event for a narrower, revocable credential designed for repeated use.**
+
+## Turn authentication into an HTTP session
+
+Hypertext Transfer Protocol (HTTP) is stateless: one request does not automatically carry the identity established by an earlier request. After checking a password, passkey, or identity-provider response, the application needs to recognize the next request from the same browser.
+
+A traditional server-side session works like this:
+
+1. The browser submits a login request over HTTPS.
+2. The server authenticates the user and creates a high-entropy, unpredictable session identifier.
+3. The server stores the session state under that identifier: user ID, tenant, authentication time, last activity, and other security context.
+4. The server returns the identifier in a cookie.
+5. On later requests, the browser sends the cookie automatically. The server looks up the session and makes a fresh authorization decision.
+
+An example cookie is:
+
+```http
+Set-Cookie: __Host-session=q9x7...; Path=/; Secure; HttpOnly; SameSite=Lax
+```
+
+The cookie should contain only a meaningless random reference—not a password or other secret user data. The important flags are:
+
+- `Secure`: send the cookie only over HTTPS.
+- `HttpOnly`: do not expose it to browser JavaScript.
+- `SameSite`: restrict when it is sent with cross-site requests. `Lax` is a practical default for many sites; `Strict` is stronger when the user experience permits it.
+- `Path=/`: make it available across the application.
+- `__Host-`: require a secure, host-only cookie with `Path=/`, preventing a less-trusted subdomain from setting it for the parent domain.
+
+**HTTPS** is HTTP protected by Transport Layer Security (TLS). TLS protects a credential while it travels over the network. It does not protect that credential after a browser or server has been compromised.
+
+The session identifier is a **bearer credential**: whoever possesses it can normally use it. A “session token” usually means this credential, but it is not one standardized format.
+
+### Why server-side sessions remain a strong default
+
+The server can invalidate a session immediately, update its privileges centrally, enforce idle and absolute timeouts, and list or terminate a user's active devices. A session is also naturally scoped to one application backend.
+
+The cost is state. Multiple application instances need a shared database or cache, replicated session data, or carefully designed request routing. That is an engineering tradeoff, not proof that sessions cannot scale. Large systems routinely scale sessions with distributed stores; the design must handle store latency, availability, expiration, and regional consistency.
+
+<Callout type="info" title="Four terms that interview answers should separate">
+**Identification** is the claimed identity, such as an email address. **Authentication** verifies that claim. **Authorization** decides whether the authenticated actor may perform an action on a resource. A **session** carries continuity and security context across requests. Authentication supplies evidence to authorization; it does not replace authorization.
+</Callout>
+
+### A session still needs browser defenses
+
+Regenerate the identifier after login and privilege changes. This prevents **session fixation**, in which an attacker causes a victim to authenticate using an identifier the attacker already knows. Enforce both an **idle timeout** and an **absolute lifetime**, and invalidate the server-side record during logout.
+
+Cookie authentication also needs protection against **Cross-Site Request Forgery (CSRF)**. Another site may cause the victim's browser to send an unwanted request with automatically attached cookies. `SameSite` reduces this risk, but sensitive state-changing requests should still use an intentional defense such as a CSRF token or a custom header combined with a restrictive Cross-Origin Resource Sharing policy.
+
+**CORS** means Cross-Origin Resource Sharing. It tells browsers which other origins may make certain cross-origin requests. CORS is not API authentication, and an overly permissive CORS policy can undermine a CSRF defense that depends on browser preflight checks.
+
+`HttpOnly` also does not make **Cross-Site Scripting (XSS)** harmless. XSS is attacker-controlled JavaScript running in the application's origin. The script may be unable to read an `HttpOnly` cookie, but it can still send authenticated requests through the victim's browser.
+
+OWASP's [Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html) covers session entropy, cookie attributes, renewal, expiration, and invalidation in detail.
+
+## Then JWT enters—and it is a format, not an authentication system
+
+A **JSON Web Token (JWT, pronounced “jot”)** is a compact way to represent claims. [RFC 7519](https://www.rfc-editor.org/rfc/rfc7519.html) defines the format. A commonly signed JWT has three Base64url-encoded sections:
+
+```text
+header.payload.signature
+```
+
+- The **header** identifies metadata such as the signing algorithm and key ID.
+- The **payload** contains claims—name/value statements about a subject or event.
+- The **signature** protects integrity and lets the recipient verify who signed it.
+
+A typical signed JWT header might contain:
+
+```json
+{
+  "alg": "RS256",
+  "kid": "2026-09-signing-key",
+  "typ": "JWT"
+}
+```
+
+- `alg` declares the signature algorithm used for this token. `RS256` means RSA PKCS #1 v1.5 with SHA-256. The verifier must independently restrict which algorithms it accepts; it must not let this untrusted header choose a weaker validation policy.
+- `kid` is the key ID. It helps the verifier select a candidate public key from the trusted issuer's JSON Web Key Set (JWKS). It is a lookup hint, not proof that the named key or issuer is trustworthy.
+- `typ` is the declared token type. `JWT` is common, while some profiles use a more specific value. The verifier should enforce a required type when its protocol defines one.
+
+A typical payload might contain:
+
+```json
+{
+  "iss": "https://identity.example.com",
+  "sub": "user-123",
+  "aud": "https://payroll-api.example.com",
+  "iat": 1789074000,
+  "exp": 1789074300,
+  "jti": "b8a9..."
+}
+```
+
+- `iss` is the issuer.
+- `sub` is the subject, normally the stable identity of a user or workload.
+- `aud` is the intended audience—the service allowed to accept the token.
+- `iat` is the issued-at time.
+- `exp` is the expiration time.
+- `jti` is a unique JWT identifier that can help with replay detection or revocation records.
+
+<Callout type="warning" title="Signed does not mean secret">
+The header and payload of a normal signed JWT—a JSON Web Signature (JWS)—are encoded, not encrypted. Anyone who obtains it can read the claims. Do not put secrets or unnecessary personal data in the payload. JSON Web Encryption (JWE) is a separate encrypted form, and encryption still does not eliminate the need for correct validation and authorization.
+</Callout>
+
+### Why teams use JWTs
+
+A service can validate a signed JWT locally with the issuer's public key instead of looking up every credential. This is useful across distributed APIs and organizational boundaries. The token can carry an issuer, audience, subject, lifetime, client, and coarse-grained permissions in an interoperable format.
+
+The tradeoff is control. If the user's role changes or the token is stolen, a service doing only local validation may accept the old claims until the token expires. Immediate revocation requires state again: token introspection, a deny list, a session or authorization version, or a gateway check.
+
+JWTs also create operational work: signing-key rotation, public-key discovery and caching, clock skew, token size, claim privacy, and strict validation. “Stateless JWT” means the verifier may avoid a per-token lookup. It does not mean the whole security system has no state.
+
+### “Session vs JWT” is useful shorthand, but technically imprecise
+
+The comparison normally means:
+
+| Model | Browser carries | Server does on each request | Main tradeoff |
+| --- | --- | --- | --- |
+| Stateful session | Opaque random session ID | Looks up current session state | Easy central control; request-time state dependency |
+| Self-contained session | Signed claims, often a JWT | Verifies signature and claims | Fewer lookups; harder immediate revocation and potentially stale claims |
+
+But a session cookie may contain a JWT, and an access token may be opaque. Google Firebase, for example, supports a [JWT-based session cookie](https://firebase.google.com/docs/auth/admin/manage-cookies). **Session** describes purpose and lifecycle; **JWT** describes format.
+
+A cookie is likewise a browser storage and delivery mechanism, not a credential type. It can carry a random session ID, a signed session object, or even an access token. An `Authorization: Bearer` header is another delivery mechanism. These choices have different exposure to JavaScript, CSRF, logging, and cross-origin rules.
+
+### Bearer vs JWT: possession rule versus format
+
+These terms answer different questions:
+
+| Term | What it describes | What it does not tell you |
+| --- | --- | --- |
+| Bearer | A usage model: possession of the credential is enough to use its authority | Whether the value is opaque, a JWT, or another format |
+| JWT | A format for carrying protected claims | Whether it is an access token, ID token, session, or bearer credential |
+
+[RFC 6750](https://www.rfc-editor.org/rfc/rfc6750.html) defines the OAuth `Bearer` access-token type and its use in HTTP. A bearer token does not require the caller to prove possession of a separate cryptographic key. Consequently, anyone who copies it can replay it until it expires or is rejected.
+
+An OAuth bearer access token may be an opaque random string or a JWT. A JWT access token is often used as a bearer token, but JWTs also represent ID tokens, signed session state, and other objects that must not be accepted as API credentials. Conversely, a session cookie usually behaves as a bearer credential even when it is not an OAuth bearer access token.
+
+A **sender-constrained token** changes the possession rule: the caller must present the token and prove control of a bound private key. The token may still use JWT as its format. In one sentence:
+
+> Bearer tells you what proof is required; JWT tells you how claims are packaged.
+
+### Decoding a JWT is not validating it
+
+An API must at least:
+
+- allow only the algorithms expected by its configuration, rather than trusting the token's `alg` header;
+- verify the signature with a key belonging to the expected issuer;
+- require the exact issuer and intended audience;
+- validate expiration and not-before times with a small, deliberate clock-skew allowance;
+- require the claims and token type defined by the application's profile; and
+- reject an identity token or another JWT type presented in place of an access token.
+
+[RFC 8725](https://www.rfc-editor.org/rfc/rfc8725.html) is the JWT security best-current-practice document. It also warns against following arbitrary key URLs received inside a token and recommends mutually exclusive validation rules for different JWT types. In practice, pin the trusted issuer and its configured JSON Object Signing and Encryption (JOSE) key-set location; do not let an untrusted `jku` header choose where the verifier downloads keys.
+
+## Why OAuth adds access and refresh tokens
+
+A session solves continuity between a browser and one application. A different problem appears when a client needs limited authority to call a separate API—especially on a user's behalf or across organizational boundaries.
+
+**OAuth 2.0** is an authorization framework for that problem. It allows a client to receive limited API authority without receiving the user's password. The four main roles are:
+
+- **Resource owner:** the person or organization able to grant access.
+- **Client:** the application requesting access. It may run on a server, in a browser, or on a device.
+- **Authorization server (AS):** the system that authenticates the user, records consent or policy, and issues tokens.
+- **Resource server (RS):** the API that owns protected resources and accepts access tokens.
+
+**OpenID Connect (OIDC)** adds an identity layer to OAuth so a client can learn about an authenticated user. A useful slogan is:
+
+> OAuth authorizes API access. OIDC authenticates the user to the client.
+
+That sentence is a map, not the protocol. Secure implementations still validate redirects, state, issuer, audience, nonce, signatures, and the rules of the chosen flow.
+
+### One provider, two jobs: Google as the concrete example
+
+Google can act as both an OAuth authorization server and an OpenID Provider. The screens and authorization-code exchange may look almost identical, but the application is asking for a different result.
+
+<OAuthOidcFlowDiagram />
+
+#### Connect Google Drive: OAuth authorization
+
+Suppose your application lets a user attach files from their Google Drive:
+
+1. Your application requests a narrow Drive scope, such as read-only file metadata.
+2. Google authenticates the user as part of processing the request and asks whether the application may receive that permission.
+3. Google returns a short-lived, one-time **authorization code** through the browser. Your application verifies that the returned `state` matches the session that began the flow. The code is not an access token and should not be called an “access code.”
+4. Your backend exchanges the code at Google's token endpoint for an access token and, when offline access was requested and approved, possibly a refresh token.
+5. Your backend presents the access token to the Google Drive API. The Drive API checks the token and its scopes before returning files.
+
+The security outcome is delegated authority: **your application may perform particular operations against Google Drive on this user's behalf**. The access token is intended for a Google API. It is not a general identity document and should not become your application's login credential merely because Google authenticated someone during the consent flow.
+
+Google documents this flow in [Using OAuth 2.0 for Web Server Applications](https://developers.google.com/identity/protocols/oauth2/web-server).
+
+#### Sign in with Google: OIDC authentication
+
+Now suppose the goal is to create a logged-in session in your application:
+
+1. Your application starts an OIDC request containing the `openid` scope, commonly with `email` and `profile`.
+2. Google authenticates the user and returns an authorization code. Your backend first verifies that the returned `state` matches the browser session that initiated login.
+3. Your backend exchanges the code and receives an **ID token** and an access token. The ID token is a signed JWT intended for your OIDC client.
+4. Your backend validates the ID token's signature, exact issuer, audience matching your client ID, expiration, and nonce when one was sent.
+5. Your application uses the `(iss, sub)` pair—issuer plus subject—as the stable external identity, loads or creates its local account, applies local status and authorization policy, and creates its own application session.
+
+The Google access token returned alongside the ID token is for Google endpoints such as UserInfo or other approved Google APIs. It is not what your backend should accept as proof of login. Google's [OIDC guide](https://developers.google.com/identity/openid-connect/openid-connect) and [server-side ID-token validation guidance](https://developers.google.com/identity/gsi/web/guides/verify-google-id-token) make this recipient distinction explicit.
+
+<Callout type="warning" title="The code is exchanged; the access token is not the login assertion">
+In the OIDC Authorization Code flow, your backend exchanges the authorization code for tokens, validates the ID token, and then issues its own session. It does not exchange a Google access token for identity. Some Sign in with Google integrations deliver an ID token directly to the backend instead of using the code flow; the backend must still validate that ID token before creating a session.
+</Callout>
+
+One authorization request can ask for both `openid` identity scopes and Google Drive scopes. The response may then support login and API access, but the artifacts do not merge: the ID token goes to the OIDC client, the access token goes to the Google API, and your application session goes to your backend. Request Drive permission only when the product feature needs it, ideally through incremental authorization rather than during basic sign-in.
+
+## Four credentials, four destinations
+
+Start with the destination. If a credential is sent to the wrong system, the design is probably confused.
+
+| Credential | What it represents | Intended recipient | Typical lifetime | Main theft impact |
+| --- | --- | --- | --- | --- |
+| Session identifier | Continuity with one application | Application backend | Idle plus absolute limits | Attacker acts through that application session |
+| Access token | Limited authority to call an API | Resource server | Short | Attacker calls that API until expiry or revocation |
+| Refresh token | Authority to obtain new access tokens | Authorization server only | Longer | Attacker may maintain access and mint new tokens |
+| ID token | Claims about an OIDC authentication event | OIDC client | Short | Attacker may confuse login state if the client validates it incorrectly |
+
+The **principle of least privilege** says each credential should carry only the minimum authority required for its task. Separation by recipient, audience, scope, and lifetime limits the damage from a leak.
+
+Token values must not appear in Uniform Resource Locators (URLs), analytics events, exception reports, or ordinary logs. URLs spread through browser history, referrer headers, screenshots, proxies, and monitoring systems.
+
+### Access token: permission to call an API
+
+The client presents an access token to the resource server, commonly in an HTTP request:
+
+```http
+GET /v1/payroll/payslips/2026-08 HTTP/1.1
+Host: payroll-api.example.com
+Authorization: Bearer eyJ...
+```
+
+The access token should be restricted by:
+
+- **Audience:** which API may accept it.
+- **Scope:** the broad operations granted to the client, such as `payslips:read`.
+- **Subject:** the user or workload represented by the request.
+- **Client:** the application to which authority was granted.
+- **Lifetime:** how long the credential remains acceptable.
+
+Those limits do not complete authorization. The payroll API must still decide whether the subject may read this particular payslip. A valid token with `payslips:read` does not mean “read every employee's payslip.” Stable boundary facts fit well in a token; fast-changing facts such as account suspension, tenant membership, ownership, transaction limits, and emergency policy often need a current server-side check.
+
+An access token can be an opaque string or a JWT. Opaque tokens normally require the API to call or share state with the authorization server, often through **token introspection**. A JWT access token can be validated locally. The standardized JWT access-token profile and its validation rules are defined in [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068.html).
+
+### Refresh token: permission to renew API access
+
+Access tokens should expire. Otherwise, a stolen bearer token could remain useful indefinitely. A refresh token lets the client obtain a new access token without sending the user through a complete interactive login each time:
+
+```http
+POST /oauth2/token HTTP/1.1
+Host: authorization.example.com
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=refresh_token&refresh_token=3f0b...
+```
+
+The client sends the refresh token only to the authorization server. It is **never** an API credential and must not be sent to the resource server.
+
+A refresh token may be an opaque random string or a JWT. “Refresh token” describes its purpose; “JWT” describes a possible format. The client should normally treat either form as an opaque secret and must not depend on decoding claims from it. Even a JWT-formatted refresh token commonly relies on authorization-server state for its grant, rotation family, reuse detection, and revocation, so using JWT does not make the refresh-token system stateless.
+
+Refresh tokens are usually longer-lived and may represent the full authorization grant, making them especially valuable to attackers. The current OAuth security guidance says an authorization server should issue one only when the client needs continued access and the risk is acceptable. It should have inactivity and maximum lifetimes, be bound to the client and granted scope, and be revoked after events such as logout, password change, or detected compromise when policy requires it.
+
+For a **public client**—one that cannot keep a client secret, such as browser or native-app code—[RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14.2) requires sender-constrained refresh tokens or refresh-token rotation to detect replay.
+
+With **refresh-token rotation**, every successful use invalidates the old refresh token and returns a new one:
+
+1. The client exchanges `RT1` and receives `AT2` plus `RT2`; `RT1` becomes invalid.
+2. It later exchanges `RT2` and receives `AT3` plus `RT3`; `RT2` becomes invalid.
+3. Reuse of `RT1` or `RT2` indicates that two parties may possess the same credential.
+
+The authorization server tracks these values as a **token family**. On detected reuse, it can revoke the active family and require a new login. Production systems also need a safe response to concurrent refreshes, retries, and lost responses. Amazon Cognito's [rotation documentation](https://docs.aws.amazon.com/cognito/latest/developerguide/amazon-cognito-user-pools-using-the-refresh-token.html) exposes a short grace period for this reason. That improves reliability but briefly extends the replay window, so it should remain small.
+
+### ID token: evidence for the client, not API authority
+
+The OIDC client uses an ID token to validate information about the login and subject. Its audience is the client. The access token's audience is the API.
+
+An API must not accept an ID token as an access token, even if both happen to be JWTs signed by the same issuer. Their purposes, audiences, required claims, and validation rules differ. Accepting one in place of the other is a **token substitution** or **cross-JWT confusion** vulnerability.
+
+## A secure browser design can use sessions and OAuth tokens together
+
+Consider a payroll web application that uses an external identity provider and calls a separate payroll API. Because payroll data is sensitive, browser JavaScript does not need direct access to OAuth tokens.
+
+Use the OIDC Authorization Code flow through a **backend for frontend (BFF)**. A BFF is a server dedicated to one frontend. It handles login, protects OAuth credentials, and proxies the frontend's API requests.
+
+<ServiceArchitectureDiagram diagram={browserTokenArchitecture} />
+
+One login and API request now looks like this:
+
+1. The BFF redirects the browser to the authorization server.
+2. After authentication, a short-lived authorization code returns through the browser.
+3. The BFF exchanges the code for an access token and, if continued access is justified, a refresh token.
+4. The BFF stores those tokens server-side and gives the browser only a hardened session cookie.
+5. For a payslip request, the BFF resolves the session and presents the access token to the payroll API.
+6. The API validates the token and authorizes access to that particular payslip.
+7. When the access token expires, only the BFF presents the refresh token to the authorization server.
+
+[RFC 10017](https://www.rfc-editor.org/rfc/rfc10017.html) strongly recommends the BFF pattern for business applications, sensitive applications, and applications that handle personal data.
+
+This design uses each credential at the narrowest useful boundary:
+
+- Browser to BFF: application session cookie.
+- BFF to payroll API: access token intended for that API.
+- BFF to authorization server: refresh token, stored server-side.
+- Authorization server to BFF during login: ID token and protocol response validated by the OIDC client.
+
+The BFF reduces token exposure to browser JavaScript, but it is now a high-value security boundary. It needs CSRF protection, correct session handling, strict outbound destinations, secure token storage, careful logging, and ordinary application authorization.
+
+## Where should the browser store credentials?
+
+There is no browser storage API that makes a bearer credential safe from malicious code running with the application's privileges. Storage choices change what that code can steal, how long the credential persists, and whether the browser sends it automatically.
+
+| Location | Readable by application JavaScript? | Sent automatically? | Persistence | Main security consequence |
+| --- | --- | --- | --- | --- |
+| `HttpOnly` cookie | No | Yes, when cookie rules match | Session-only or persistent | Reduces direct token theft through XSS; requires CSRF defenses |
+| `localStorage` | Yes, by scripts in the origin | No | Across reloads, tabs, and browser restarts | One XSS can extract long-lived credentials |
+| `sessionStorage` | Yes, by scripts in the origin | No | Until that tab closes | Smaller persistence window, but still readable through XSS |
+| JavaScript memory | Yes, unless further isolated | No | Until reload or tab closure | Limits persistence; active malicious code may still read or use the token |
+| Web or Service Worker memory | Not directly, if designed correctly | No | Worker-dependent | Can reduce direct extraction; malicious app code may still ask the worker to make requests |
+
+`localStorage`, `sessionStorage`, and IndexedDB are **origin-scoped**: JavaScript executing in the same scheme, host, and port can access them according to the API's rules. They do not offer an `HttpOnly` equivalent. `sessionStorage` is tab-scoped and shorter-lived than `localStorage`, but it is not a security boundary against XSS.
+
+The fact that Web Storage is not sent automatically is useful: an application can explicitly place an access token in an `Authorization` header, so ordinary cross-site requests do not automatically carry it. That reduces traditional CSRF exposure. The other side of the tradeoff is that same-origin JavaScript can read and exfiltrate the credential.
+
+An `HttpOnly` cookie reverses those properties. JavaScript cannot directly read its value, but the browser automatically sends it to matching destinations. The application therefore needs `SameSite` plus a deliberate CSRF defense. XSS may still issue requests through the victim's session, but preventing the attacker from exporting a reusable credential is a meaningful reduction in impact.
+
+<Callout type="warning" title="Do not put a token in a JavaScript-readable cookie">
+A cookie created or read through `document.cookie` combines two drawbacks: application JavaScript can steal the token, and the browser may also attach it automatically to matching requests. If a cookie represents authentication, make it `HttpOnly` and design it to be consumed by the backend—not copied by JavaScript into an authorization header.
+</Callout>
+
+### Practical storage choices
+
+For a first-party or sensitive application with a BFF:
+
+1. Give the browser only an opaque session identifier in a `Secure`, `HttpOnly`, appropriately `SameSite` cookie.
+2. Store access and refresh tokens on the server, associated with that session.
+3. Apply CSRF protection and resource-level authorization to every state-changing request.
+4. Align the application session lifetime with the underlying authorization grant, and invalidate the session when token renewal is no longer possible.
+
+For a browser-only **Single-Page Application (SPA)** that must call an API directly:
+
+1. Prefer keeping the short-lived access token in memory or an isolated worker rather than persistent storage.
+2. Accept that a reload may lose the token and require silent or interactive reauthorization; this is a security-versus-convenience choice.
+3. Issue a refresh token only when continued access is necessary. Rotate or sender-constrain it, bound its lifetime, and minimize where it persists.
+4. Invest heavily in preventing malicious JavaScript: strict output encoding, safe framework APIs, a restrictive Content Security Policy (CSP), dependency controls, and isolation from untrusted scripts.
+
+**Content Security Policy (CSP)** is a browser-enforced policy that restricts which scripts and other resources a page may load or execute. It is an important defense in depth against XSS, not permission to store credentials carelessly.
+
+Encrypting a token before writing it to `localStorage` rarely solves the XSS problem if the same JavaScript environment can access the decryption key or call the decryption function. The attacker can wait for plaintext or use the application's credential-handling path. Browser storage is also not guaranteed to be encrypted at rest against malware or someone who can read the browser profile.
+
+The [OWASP HTML5 Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/HTML5_Security_Cheat_Sheet.html) advises against storing session identifiers or sensitive information in `localStorage`. [RFC 10017's browser token-storage analysis](https://www.rfc-editor.org/rfc/rfc10017.html#section-8) reaches the broader architectural conclusion: isolation and shorter persistence can reduce theft of existing tokens, but malicious application code may still obtain fresh tokens or act through the browser.
+
+## When to choose another architecture
+
+The BFF is a strong default for a sensitive browser application, but it is not the only valid design.
+
+| Application | Client holds | Server holds | Why |
+| --- | --- | --- | --- |
+| First-party web app on one domain | Session cookie | Application session | OAuth between the browser and its own backend may add no useful boundary |
+| Sensitive single-page app with a BFF | Session cookie | Session plus access and refresh tokens | Keeps OAuth tokens away from browser JavaScript |
+| Browser-only single-page app calling an API | Short-lived access token; refresh token only if justified | No BFF session | Required when the browser must call a separate API directly, with greater theft exposure |
+| Native or mobile app | Access token and protected refresh token | API state | Uses the system browser and operating-system credential storage |
+| Third-party integration | Access token and optional refresh token | Client's protected storage | OAuth supports delegated access across application boundaries |
+| Machine-to-machine workload | Short-lived access token | Workload credential or private key | A confidential workload can authenticate again without a user refresh token |
+
+An SPA uses browser JavaScript to update the interface and call APIs without loading a new document for every interaction. For a first-party frontend and backend on the same domain, [RFC 10017](https://www.rfc-editor.org/rfc/rfc10017.html#section-7.1) notes that a server-side cookie session may be sufficient. OAuth is not mandatory merely because an application is modern.
+
+If a browser-only SPA genuinely needs direct API access, use Authorization Code with **Proof Key for Code Exchange (PKCE, pronounced “pixy”)**. PKCE binds an authorization request to a secret verifier held by that client instance. A stolen authorization code cannot be exchanged without the verifier.
+
+PKCE protects the authorization-code exchange. It does **not** stop malicious JavaScript from stealing an access token after issuance or initiating requests as the application. The older OAuth implicit flow returns an access token in the authorization response and is now discouraged; use the code flow instead ([RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html#section-2.1)). The Resource Owner Password Credentials grant asks the client to collect the user's password and must not be used in modern designs.
+
+For a browser-only design, keep tokens short-lived and no broader than necessary. Avoid persistent JavaScript-readable storage for sensitive credentials. If a refresh token is necessary, use rotation or sender constraint and enforce both inactivity and maximum lifetimes. Okta's [refresh-token guidance](https://developer.okta.com/docs/guides/refresh-tokens/main/) describes the additional risk of persistent refresh tokens in public browser clients.
+
+## Does mobile authentication use the same lifecycle?
+
+Mostly yes—but “mobile” can mean two different things. A website opened in mobile Safari or Chrome is still a browser application, so the earlier cookie, BFF, Web Storage, XSS, and CSRF analysis applies. An installed native or hybrid application has a different client boundary.
+
+The credential meanings remain the same:
+
+- an ID token tells the OIDC client about an authentication event;
+- an access token goes to its intended API;
+- a refresh token goes only to the authorization server; and
+- the application may create its own backend session instead of exposing OAuth tokens to every local component.
+
+What changes is how the authorization flow returns to the application and where credentials can be protected.
+
+| Concern | Browser application with a BFF | Installed mobile application |
+| --- | --- | --- |
+| OAuth client type | BFF is a confidential client that can protect a client credential | Normally a public client; a secret compiled into the app can be extracted |
+| Login interface | Top-level browser redirect | System browser or a secure in-app browser tab—not an app-controlled WebView |
+| Code protection | Authorization Code flow; PKCE should be used | Authorization Code flow with PKCE is required by the native-app best practice |
+| Return path | Registered HTTPS redirect to the BFF | Claimed HTTPS app link/universal link when possible, or a carefully registered private-use URI scheme |
+| Long-lived credential | Refresh token stays at the BFF | If needed, refresh token is kept in OS-protected application storage |
+| Local threats | XSS, CSRF, malicious dependencies, browser storage theft | Malicious apps, redirect interception, repackaging, rooted or jailbroken devices, backups, logs, and compromised app processes |
+
+### The native authorization flow
+
+[RFC 8252](https://www.rfc-editor.org/rfc/rfc8252.html), OAuth 2.0 for Native Apps, defines the recommended shape:
+
+<MobileAuthFlowDiagram />
+
+1. The app creates a high-entropy PKCE verifier and its derived challenge. For OIDC login, it also creates request-correlation values such as `state` and `nonce`.
+2. The app opens the authorization request in an **external user-agent**: normally the system browser or a browser-controlled in-app tab.
+3. The authorization server authenticates the user. The browser may already have an IdP session, enabling mobile SSO without exposing that cookie to the app.
+4. The authorization server redirects a one-time authorization code to the app's registered redirect URI.
+5. The operating system routes the redirect back to the app. The app verifies the returned request state and exchanges the code plus the original PKCE verifier at the token endpoint.
+6. The app validates the OIDC response and ID token when logging the user in, then presents only the access token intended for each API.
+
+#### Worked example: from random values to an API call
+
+The following provider-neutral example makes those six steps concrete. `id.example.com` is the identity provider, `payroll-mobile` is the public client's registered `client_id`, and `https://app.example.com/oauth/callback` is its registered app link. Client registration supplies the client ID and permitted redirect URIs; the provider's [OIDC discovery metadata](https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderConfig) supplies its exact issuer, authorization endpoint, token endpoint, and signing-key location. In a real application, use a maintained OAuth/OIDC library and the platform's secure browser-session API. The shell commands are here to expose the mechanics, not to replace the mobile SDK.
+
+The app—not the identity provider—creates fresh PKCE, `state`, and `nonce` values for each login attempt. It keeps the original values in a short-lived **pending-login transaction** so it can check the response that comes back. A cryptographically secure operating-system random-number generator should supply the entropy.
+
+This command-line equivalent creates a 32-byte random verifier, transforms it with SHA-256 and unpadded Base64url encoding, and creates independent random `state` and `nonce` values:
+
+```bash
+CODE_VERIFIER="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
+CODE_CHALLENGE="$(
+  printf '%s' "$CODE_VERIFIER" |
+    openssl dgst -binary -sha256 |
+    openssl base64 -A |
+    tr '+/' '-_' |
+    tr -d '='
+)"
+STATE="$(openssl rand -hex 16)"
+NONCE="$(openssl rand -hex 16)"
+```
+
+[RFC 7636](https://www.rfc-editor.org/rfc/rfc7636.html#section-4.1) requires a `code_verifier` between 43 and 128 permitted characters and defines the recommended `S256` challenge as:
+
+```text
+code_challenge = BASE64URL(SHA-256(ASCII(code_verifier)))
+```
+
+The four values have separate jobs:
+
+| Value | What leaves the app | Who checks it later |
+| --- | --- | --- |
+| `code_verifier` | Nothing during authorization; the derived challenge is sent instead | The authorization server hashes the verifier received at the token endpoint and compares the result with the original challenge |
+| `code_challenge` | Sent in the authorization request with method `S256` | The authorization server binds it to the authorization code |
+| `state` | Sent out and returned beside the code | The app compares it with its pending-login transaction before exchanging the code; a missing, reused, or mismatched value fails the login |
+| `nonce` | Sent out and later copied into the ID token | The app compares the ID token claim with its pending-login transaction during OIDC validation |
+
+**1. Open the authorization request in the system browser.** The native app asks the platform browser to navigate to a URL like this. Line breaks are only for readability:
+
+```http
+GET /authorize?
+  response_type=code
+  &client_id=payroll-mobile
+  &redirect_uri=https%3A%2F%2Fapp.example.com%2Foauth%2Fcallback
+  &scope=openid%20profile%20payroll.read
+  &state=af0ifjsldkj-7uY9z
+  &nonce=n-0S6_WzA2Mj
+  &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+  &code_challenge_method=S256 HTTP/1.1
+Host: id.example.com
+```
+
+`response_type=code` requests an authorization code. The `openid` scope turns the request into an OIDC authentication request, so a successfully exchanged code can produce an ID token. `payroll.read` asks for delegated API authority; real scope names are provider-specific. `state` correlates the browser callback with the login the app started, while `nonce` correlates the resulting ID token with that OIDC request ([OpenID Connect Core](https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest)).
+
+The browser may reuse an existing identity-provider cookie or ask the user to authenticate and consent. After success, the authorization server redirects the browser to the exact registered URI. This response is also wrapped across lines only for readability:
+
+```http
+HTTP/1.1 302 Found
+Location: https://app.example.com/oauth/callback
+  ?code=SplxlOBeZQQYbYS6WxSbIA
+  &state=af0ifjsldkj-7uY9z
+```
+
+The operating system recognizes the app link and opens the mobile app. The app must first find the pending transaction and compare the returned `state`. The `code` is a short-lived, one-time grant—not an access token and not a value to send to the API.
+
+**2. Exchange the code at the token endpoint.** The app now sends a back-channel HTTPS `POST` whose body is `application/x-www-form-urlencoded`, not JSON. The `redirect_uri` must exactly match the one used in the authorization request. The verifier below is the value that produced the challenge in the preceding example:
+
+```bash
+curl --request POST 'https://id.example.com/token' \
+  --header 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode 'grant_type=authorization_code' \
+  --data-urlencode 'client_id=payroll-mobile' \
+  --data-urlencode 'code=SplxlOBeZQQYbYS6WxSbIA' \
+  --data-urlencode 'redirect_uri=https://app.example.com/oauth/callback' \
+  --data-urlencode 'code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk'
+```
+
+There is deliberately no `client_secret`. A native app is a **public client** because a secret compiled into an installable application can be extracted. The authorization server instead checks that the code belongs to `payroll-mobile`, has not expired or been used, has the same redirect URI, and that hashing this `code_verifier` reproduces the stored challenge ([RFC 7636](https://www.rfc-editor.org/rfc/rfc7636.html#section-4.6)). A mismatch returns `invalid_grant` rather than tokens.
+
+A successful OIDC token response resembles this:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: no-store
+Pragma: no-cache
+
+{
+  "access_token": "at_7Qp9...",
+  "token_type": "Bearer",
+  "expires_in": 900,
+  "scope": "openid profile payroll.read",
+  "id_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6Ii4uLiJ9...",
+  "refresh_token": "rt_2kF8..."
+}
+```
+
+The values and 15-minute lifetime are illustrative, and a refresh token is optional. Before treating the user as logged in, the app's OIDC library validates the ID token signature and its exact issuer, audience, expiration, and `nonce`. The access token is for the API; the ID token is for the client. Neither should be substituted for the other.
+
+**3. Call the intended API.** The app sends the access token—not the authorization code, ID token, refresh token, or PKCE verifier—to the resource server:
+
+```bash
+curl 'https://api.example.com/v1/payroll/me' \
+  --header 'Authorization: Bearer at_7Qp9...'
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "employee_id": "emp_1234",
+  "current_pay_period": "2026-09"
+}
+```
+
+The API validates that the access token was issued by the trusted authorization server, targets this API, is unexpired, and carries the required scope. It must still apply its own resource-level authorization—for example, whether this subject may read `emp_1234`.
+
+A **claimed HTTPS redirect**—called an app link on Android and a universal link on Apple platforms—lets the operating system verify that the app is associated with the redirect domain. It is preferable when supported. A custom scheme such as `com.example.payroll:/oauth2redirect` can also reopen the app, but another installed app may attempt to claim the same scheme. PKCE prevents an interceptor from redeeming the stolen code without the verifier, but exact redirect registration and platform link verification still matter.
+
+<Callout type="warning" title="Do not put the identity-provider login inside an app-controlled WebView">
+An embedded WebView can let the host application inspect the login page, capture keystrokes, or access authentication cookies. It also loses the system browser's shared authentication session and visible trust signals. RFC 8252 requires an external user-agent for native OAuth authorization. A browser-controlled authentication tab may still appear inside the app, but the browser or operating system—not the host app—owns its page content, cookie storage, and trust UI; the app asks it to open a URL and receives only the final callback.
+</Callout>
+
+### Mobile storage is stronger than `localStorage`, not invulnerable
+
+A native app has no `HttpOnly` flag that magically protects an arbitrary token from its own compromised process. Use the operating system's application-isolated secret storage: Keychain services on Apple platforms, or encrypted app storage whose key is protected by the [Android Keystore](https://developer.android.com/privacy-and-security/keystore). Where the threat model justifies it, bind cryptographic-key use to recent device authentication or secure hardware.
+
+Keep access tokens brief and avoid persisting them when the product can recover cleanly. Persist a refresh token only when users need continuity across app restarts. For a public client, current OAuth security guidance requires refresh-token rotation or sender constraint so replay can be detected or prevented ([RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14.2)). Revoke the grant on logout or device removal according to policy, and never put tokens in analytics, crash reports, notifications, clipboard contents, deep-link query logs, or ordinary backups.
+
+OS storage narrows extraction risk, but code running inside a compromised app process may still ask the operating system to use a protected key or may copy a token after retrieval. Root or jailbreak signals, application attestation, and device integrity can inform a risk decision; they are defense in depth, not proof of the user's identity and not substitutes for token validation.
+
+Mobile SSO therefore follows the same federation model as web SSO: the IdP owns its browser session, while each app receives a response intended for its own client ID and establishes its own local state. The app does not read the IdP cookie, and one mobile app should not receive another app's access or refresh token.
+
+## Design for theft, revocation, and stale authority
+
+A senior security review assumes a credential will eventually leak. The architecture should bound the damage and make the event observable.
+
+### Reduce access-token replay
+
+Keep access tokens short-lived, audience-restricted, and narrowly scoped. “Short-lived” is not one universal number. Choose the lifetime from the API's risk, user experience, and acceptable theft-to-revocation window—not from a copied default.
+
+Where replay risk justifies the complexity, use a **sender-constrained token**. Unlike a bearer token, it requires proof that the caller holds a particular private key.
+
+- **DPoP** means Demonstrating Proof of Possession. The client signs an application-level proof for HTTP requests ([RFC 9449](https://www.rfc-editor.org/rfc/rfc9449.html)).
+- **mTLS** means mutual Transport Layer Security. Both sides authenticate with certificates, and the token can be bound to the client's certificate ([RFC 8705](https://www.rfc-editor.org/rfc/rfc8705.html)).
+
+Sender constraint reduces replay after token theft. It does not save a fully compromised client that can use both the token and its private key.
+
+### Be precise about logout and revocation
+
+Deleting an application session immediately stops its cookie from resolving to an active session. Revoking a refresh token stops future access tokens from being minted from that grant.
+
+An already-issued self-contained access token is different. An API performing only local JWT validation may continue to accept it until expiration. Immediate revocation requires an additional stateful check. [RFC 7009](https://www.rfc-editor.org/rfc/rfc7009.html) defines token revocation, but the authorization server's design determines propagation and whether revoking one token invalidates related tokens.
+
+During logout, decide which boundaries must end:
+
+1. Invalidate the local application session and clear its cookie.
+2. Revoke the refresh token or authorization grant when appropriate.
+3. Decide whether existing access tokens may expire naturally or require immediate denial.
+4. Decide whether to end only this application session, the identity-provider session, or every device session. These are different user experiences and security actions.
+
+### Protect the entire credential lifecycle
+
+Inventory where each credential can be read, transmitted, cached, backed up, or logged. Protect authorization codes, cookies, tokens, signing keys, and session stores—not just the login form.
+
+Rotate signing keys without disabling validation prematurely: publish the new public key, begin signing with it, and retain the old verification key until every token it signed has expired. Verifiers should cache the trusted JSON Web Key Set (JWKS), refresh it safely when an expected key ID is unknown, and fail closed for untrusted issuers or key locations.
+
+Monitor behavior without recording raw credentials. Useful signals include refresh-family reuse, impossible travel, sudden audience or scope anomalies, excessive validation failures, a session changing network or device characteristics, and high-risk actions soon after authentication changes.
+
+## Finally, SSO connects multiple application sessions
+
+**Single Sign-On (SSO)** is the user experience of authenticating once and then reaching multiple related applications without repeatedly entering a primary credential. SSO is an architectural pattern, not a wire protocol and not a token format.
+
+The shared trust is called **identity federation**. An **Identity Provider (IdP)** authenticates the user and issues a signed assertion about that event. An application that trusts and validates the assertion is a **Relying Party (RP)** in OIDC terminology or a **Service Provider (SP)** in Security Assertion Markup Language (SAML) terminology.
+
+<ServiceArchitectureDiagram diagram={ssoArchitecture} />
+
+The browser does not send one global “SSO cookie” directly to Gmail, Drive, and every other application. Cookies are scoped by domain, path, and related browser rules. A typical service-provider-initiated flow is:
+
+1. The user authenticates at the IdP. The IdP creates its own SSO session and sets a cookie for the IdP's domain.
+2. The user opens Application A. Because A has no local session, it redirects the browser to the IdP with an authentication request.
+3. The browser sends the IdP cookie only to the IdP. If that session and policy are sufficient, the IdP does not ask for the password again.
+4. The IdP returns a fresh, audience-restricted OIDC response or SAML assertion for Application A.
+5. Application A validates the response, maps the external subject to its local account, and creates its own application session.
+6. Application B later repeats the process and creates a separate session B.
+
+This separation matters. Compromising Application A should not reveal the IdP's cookie or Application B's session. Each application has its own lifetime, risk checks, account status, and authorization policy. The IdP proves an authentication event and selected attributes; it does not automatically grant access to every record in every application.
+
+### OIDC and SAML are common ways to deliver SSO
+
+| Protocol | Core artifact | Typical fit | What the application must do |
+| --- | --- | --- | --- |
+| OIDC | ID token plus an OAuth protocol response; usually JSON and JWT | Modern web, mobile, and API-centered systems | Validate the OIDC response and ID token, correlate the request, map `(iss, sub)` to a local account, then create a local session |
+| SAML 2.0 | Signed XML assertion carried in a SAML response | Enterprise browser SSO and established business integrations | Validate the response, signature, issuer, audience, destination, time conditions, request correlation, and replay defenses, then create a local security context |
+
+OIDC is an identity layer built on OAuth 2.0. SAML is a separate federation framework. Either can produce an SSO experience because the repeated login is avoided by the IdP session—not because all applications adopt the same token format. The OASIS [SAML 2.0 Technical Overview](https://docs.oasis-open.org/security/saml/Post2.0/sstc-saml-tech-overview-2.0.html) describes the IdP assertion and SP-local security context; [OpenID Connect Session Management](https://openid.net/specs/openid-connect-session-1_0.html) similarly distinguishes the OpenID Provider session from the RP session.
+
+Treat account linking as a security decision. In OIDC, the stable external identity is the exact `(issuer, subject)` pair, not an email address that may change or be reassigned. Provisioning and deprovisioning may use an administrative lifecycle protocol such as **System for Cross-domain Identity Management (SCIM)**, but login federation and account lifecycle are different jobs.
+
+<Callout type="warning" title="SSO also concentrates risk">
+SSO reduces password exposure and centralizes strong authentication, policy, and account shutdown. It also makes the IdP and its session high-value targets: an IdP compromise can affect many applications. Protect the IdP with phishing-resistant MFA, brief and risk-aware sessions, hardened administration, signing-key rotation, monitoring, and tested recovery.
+</Callout>
+
+### Logout has three different meanings
+
+“Log out” is ambiguous in a federated system:
+
+- **Local logout** invalidates Application A's session. Visiting A again may immediately sign the user back in because the IdP session still exists.
+- **IdP logout** ends the IdP's SSO session, but existing application sessions may continue unless the protocol and applications coordinate logout.
+- **Global logout** attempts to end sessions across participating applications and devices. It is harder, can fail partially, and must be designed and tested explicitly.
+
+The same distinction applies to reauthentication. An application handling a payroll change may require a fresh, phishing-resistant authentication even while the general SSO session remains valid. SSO means fewer prompts, not “authenticate once for unlimited time and risk.”
+
+This completes the authentication path: a primary authenticator creates confidence at one verifier; sessions carry that confidence over time; federation carries a bounded assertion to another application; and every application still makes its own authorization decision. Roles, Attribute-Based Access Control (ABAC), Relationship-Based Access Control (ReBAC), tenant isolation, and resource policy are the next layer—not extra meanings to squeeze into an access token.
+
+## A compact decision process
+
+Use a server-managed session when the browser calls its own backend. When OAuth is needed, prefer a BFF for sensitive browser applications. Let browser JavaScript hold tokens only when it must call an API directly. Treat an installed native app as a public client: use the system browser, Authorization Code with PKCE, a verified return path, and OS-protected storage. Issue a refresh token only when the client needs continued access and can protect the credential throughout its lifecycle.
+
+Then ask:
+
+1. Who is the issuer, holder, and intended recipient of each credential?
+2. What exact API, scope, tenant, user, and client can use it?
+3. Where can it be read, transmitted, persisted, backed up, or logged?
+4. How quickly must theft, logout, account suspension, or a removed permission take effect?
+5. Can abnormal reuse be detected and tied to one session, grant, or token family without logging the secret?
+
+The goal is not to maximize token types. It is to minimize the number of bearer credentials, the components that can read them, their authority, and the time they remain useful.
+
+## Interview questions and concise answers
+
+### Is HTTP Basic authentication encrypted because it uses Base64?
+
+No. Base64 is reversible encoding. Basic authentication repeatedly sends a password-equivalent value, so TLS is mandatory; the design still has credential caching, replay, and logout limitations that make it a poor default for modern human login.
+
+### Should the browser hash or encrypt a password before sending it?
+
+Do not invent an application-layer substitute for HTTPS. A stable client-side hash becomes a replayable password equivalent, while custom encryption creates a key-distribution problem. Send the password through an authenticated TLS connection and store only a salted, slow password-KDF verifier on the server.
+
+### Why hash passwords instead of encrypting them?
+
+Encryption is reversible and requires a decryption key; compromise of that key reveals every password. Password verification does not need the original value. A salted, deliberately expensive KDF such as Argon2id makes each offline guess costly and lets the server compare verifiers without recovering the password.
+
+### Do passkeys remove the need for sessions?
+
+No. A passkey changes the authentication ceremony from a shared secret to an origin-bound public-key proof. After the proof succeeds, a web application still needs a session credential for subsequent HTTP requests.
+
+### Is a passkey authenticator an online service or a local trust store?
+
+Neither description is universally correct. It is the cryptographic component reached through the browser or operating system: it may be built into the device, be a separate security key or nearby phone, or use a protected passkey provider that synchronizes credentials. The website stores the public key and receives signed assertions; it never receives the private key or the biometric used to unlock it.
+
+### Is an API key the same as a user access token?
+
+Usually not. An API key commonly identifies a calling application or project and may carry static bearer authority. A user access token represents a delegated grant for a particular subject, client, audience, scope, and lifetime. Some products name credentials differently, so follow the issuer's security contract rather than the label alone.
+
+### Session or JWT—which should I use?
+
+That question mixes purpose with format. For one browser and its backend, a server-side session is a strong default when central revocation and fresh state matter. A JWT is useful when recipients need portable signed claims and local validation. A session can itself be represented by a JWT, so begin with trust boundaries and lifecycle rather than the format.
+
+### Do JWTs scale better than sessions?
+
+They can remove a session-store lookup from the request path, but they add key distribution, revocation, claim freshness, and larger-request costs. Server sessions scale with shared or distributed stores. The correct answer is a tradeoff analysis, not “JWT is stateless, therefore it scales.”
+
+### Is a JWT encrypted?
+
+Usually not. A normal JWS protects integrity and authenticity, while its payload remains readable. JWE provides encryption. Do not put secrets in a JWT merely because it is signed.
+
+### Is every JWT a bearer token? Is every bearer token a JWT?
+
+No to both. JWT is a format, while bearer is a usage model in which possession is sufficient. A bearer token can be opaque or JWT-formatted; a JWT can be an access token, ID token, session object, or another signed claim set. Identify the credential's purpose and validation profile before accepting it.
+
+### Can a JWT be stored in a cookie?
+
+Yes. JWT is a format and cookie is a browser delivery mechanism. Doing so creates cookie-related requirements such as CSRF defenses, cookie size limits, and secure attributes; it does not automatically make the design safe or unsafe.
+
+### JWT or opaque access token?
+
+Use a JWT when independent local validation and interoperability are worth the revocation and stale-claim tradeoffs. Use an opaque token when centralized introspection, claim concealment, and immediate control matter more. Follow the issuer's contract; do not parse a vendor token simply because it resembles a JWT.
+
+### Cookies or `localStorage` for browser credentials?
+
+An `HttpOnly` cookie prevents JavaScript from directly reading the credential but is sent automatically, so it needs CSRF protection. `localStorage` is not sent automatically, but every same-origin script can read and export its persistent contents. For sensitive applications, prefer a BFF with an `HttpOnly` session cookie and server-side token storage. A browser-only client should minimize authority and persistence, preferably keeping short-lived access tokens in memory.
+
+### Does `HttpOnly` prevent XSS?
+
+No. It prevents JavaScript from reading the cookie value. Injected code can still make authenticated requests from the victim's browser.
+
+### What is the difference between an access token and an ID token?
+
+The access token is intended for the resource server and carries API authority. The ID token is intended for the OIDC client and carries claims about authentication. An API must not accept an ID token as an access token.
+
+### After OIDC login, what credential should the browser receive?
+
+In a server-backed web application or BFF design, the backend validates the OIDC response, maps the external subject to a local account, and gives the browser a hardened application-session cookie. It keeps access and refresh tokens server-side. A browser-only SPA receives an access token only when it must call the API directly; that is a different architecture with greater browser exposure.
+
+### Is “Sign in with Google” OAuth or OIDC?
+
+The login use case is OIDC, an identity layer built on OAuth. “Connect Google Drive” is OAuth authorization: the resulting access token goes to the Drive API. “Sign in with Google” uses a validated ID token to establish identity, after which your application creates its own session. Both may use an authorization code, but their outputs and recipients are different.
+
+### Why are access tokens short-lived if refresh tokens live longer?
+
+The API sees only a narrow, short-lived credential. The more powerful renewal credential remains at the authorization-server boundary, where the client can protect it and the server can rotate, expire, or revoke it.
+
+### How does refresh-token rotation detect theft?
+
+The authorization server invalidates the old token after use but remembers its family. Reuse of an older family member suggests that two parties possess the credential, so the server revokes the active family and requires fresh authorization.
+
+### Is a refresh token also a JWT?
+
+It can be, but it does not have to be. Refresh token describes the credential's purpose, while JWT describes a format. The client should treat both opaque and JWT-formatted refresh tokens as secrets, send them only to the authorization server, and avoid depending on decoded claims. JWT formatting does not remove the server-side state needed for rotation, reuse detection, or revocation.
+
+### Does PKCE protect access tokens?
+
+No. PKCE protects the authorization code from interception or injection during the code exchange. It does not prevent theft or replay of a token after issuance.
+
+### Is an installed mobile app a confidential OAuth client?
+
+Normally no. Code and static secrets distributed in an application package can be extracted, so the app is treated as a public client. PKCE protects its authorization-code exchange; it does not turn the app into a confidential client. A separate backend can be confidential because its credentials remain on the server.
+
+### Should a mobile app authenticate inside a WebView?
+
+Not for OAuth or OIDC with an external provider. Use the system browser or a browser-controlled authentication session so the app cannot inspect credentials or IdP cookies and the user can reuse the browser's SSO session.
+
+### What is the difference between a WebView and an in-app browser tab?
+
+A WebView is a rendering component controlled by the host app, which may be able to inspect or modify content and cookies. An in-app browser tab is controlled by the browser or operating system even though it appears inside the app. The host app can start the navigation and receive the registered callback, but it cannot read the identity-provider login page or cookie jar.
+
+### Where should a mobile app store refresh tokens?
+
+Only persist one when continued access is required. Use application-isolated OS protection such as Apple Keychain or Keystore-backed encryption on Android, rotate or sender-constrain the token, limit its lifetime, and keep it out of logs and backups. Protected storage reduces extraction; it cannot make a compromised process trustworthy.
+
+### How do I revoke a JWT immediately?
+
+Expiration alone cannot provide immediate revocation. Add a stateful check such as introspection, a deny list, a session or grant version, or an authorization gateway—or accept a bounded delay by using a sufficiently short lifetime.
+
+### What is the difference between CSRF and XSS in this design?
+
+CSRF abuses the browser's automatic credential sending to issue unwanted requests. XSS runs attacker-controlled code inside the trusted origin. `SameSite` and CSRF tokens primarily address CSRF; output encoding, safe templating, Content Security Policy, dependency hygiene, and avoiding dangerous browser APIs reduce XSS. Neither defense substitutes for resource-level authorization.
+
+### What should happen during logout?
+
+Invalidate the local session, clear its cookie, revoke the refresh token or grant when appropriate, and decide whether already-issued access tokens need immediate denial or may expire. Be explicit about whether logout is local, identity-provider-wide, or global across devices.
+
+### Is SSO a protocol?
+
+No. SSO is the experience of authenticating once and reaching multiple applications. OIDC and SAML 2.0 are federation protocols that can deliver that experience; Kerberos and other systems can do so as well.
+
+### Does SSO mean every application shares one session cookie?
+
+No. The IdP keeps an IdP-domain session. Each application redirects to the IdP, validates a response intended for itself, and creates its own local session. Cookie scoping and separate audiences preserve those boundaries.
+
+### What is the difference between SSO, federation, and provisioning?
+
+SSO describes the reduced-prompt user experience. Federation is the trust and protocol exchange through which an IdP sends an assertion to a relying party. Provisioning creates, updates, and removes application accounts and entitlements—often through SCIM—and must not be assumed to happen merely because login federation works.
+
+## The short answer
+
+For human login, use an established identity system with passkeys or passwords protected by TLS, a slow salted password KDF, rate limiting, breached-password checks, recovery controls, and MFA appropriate to the risk. After authentication, a first-party web application should usually start with a secure server-managed session.
+
+If the frontend must use OAuth to reach separate APIs, prefer a BFF for sensitive applications: the browser keeps a hardened session cookie, the BFF protects access and refresh tokens, and each API receives only the access token intended for it.
+
+Expose OAuth tokens directly to browser JavaScript only when direct API access is an architectural requirement and the threat model accepts the additional attack surface. Issue a refresh token only when continued access is needed and the client can protect, rotate, expire, and revoke it.
+
+For an installed mobile app, use the system browser and Authorization Code with PKCE. Return through a claimed HTTPS link when possible, treat the app as a public client, and keep any necessary refresh token in OS-protected storage with rotation or sender constraint.
+
+Use OIDC or SAML federation when multiple applications should trust a central IdP, and let every application create and control its own session. Do not begin with “JWT or cookie?” Begin with purpose, trust boundaries, recipients, lifetime, theft, and revocation. The format and transport follow from those decisions.
+
+## Further reading
+
+### Standards and security guidance
+
+- IETF, [The 'Basic' HTTP Authentication Scheme](https://www.rfc-editor.org/rfc/rfc7617.html), RFC 7617, September 2015.
+- IETF, [HTTP Digest Access Authentication](https://www.rfc-editor.org/rfc/rfc7616.html), RFC 7616, September 2015.
+- IETF, [The Transport Layer Security Protocol Version 1.3](https://www.rfc-editor.org/rfc/rfc8446.html), RFC 8446, August 2018.
+- IETF, [JSON Web Token](https://www.rfc-editor.org/rfc/rfc7519.html), RFC 7519, May 2015.
+- IETF, [JSON Web Token Best Current Practices](https://www.rfc-editor.org/rfc/rfc8725.html), RFC 8725, February 2020.
+- IETF, [The OAuth 2.0 Authorization Framework](https://www.rfc-editor.org/rfc/rfc6749.html), RFC 6749, October 2012.
+- IETF, [The OAuth 2.0 Authorization Framework: Bearer Token Usage](https://www.rfc-editor.org/rfc/rfc6750.html), RFC 6750, October 2012.
+- IETF, [Best Current Practice for OAuth 2.0 Security](https://www.rfc-editor.org/rfc/rfc9700.html), RFC 9700, January 2025.
+- IETF, [OAuth 2.0 for Browser-Based Applications](https://www.rfc-editor.org/rfc/rfc10017.html), RFC 10017, August 2026.
+- IETF, [OAuth 2.0 for Native Apps](https://www.rfc-editor.org/rfc/rfc8252.html), RFC 8252, October 2017.
+- IETF, [JWT Profile for OAuth 2.0 Access Tokens](https://www.rfc-editor.org/rfc/rfc9068.html), RFC 9068, October 2021.
+- OpenID Foundation, [OpenID Connect Core 1.0 incorporating errata set 2](https://openid.net/specs/openid-connect-core-1_0.html), December 2023.
+- OpenID Foundation, [OpenID Connect Session Management 1.0](https://openid.net/specs/openid-connect-session-1_0.html), September 2022.
+- OASIS, [SAML 2.0 Technical Overview](https://docs.oasis-open.org/security/saml/Post2.0/sstc-saml-tech-overview-2.0.html), March 2008.
+- W3C, [Web Authentication: An API for Accessing Public Key Credentials—Level 3](https://www.w3.org/TR/webauthn-3/).
+- NIST, [Digital Identity Guidelines: Authentication and Authenticator Management](https://pages.nist.gov/800-63-4/sp800-63b.html), SP 800-63B-4, July 2025.
+- NIST, [Digital Identity Guidelines: Federation and Assertions](https://pages.nist.gov/800-63-4/sp800-63c.html), SP 800-63C-4, July 2025.
+- OWASP, [Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html).
+- OWASP, [Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html).
+- OWASP, [OAuth 2.0 Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/OAuth2_Cheat_Sheet.html).
+- OWASP, [Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html).
+- OWASP, [HTML5 Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/HTML5_Security_Cheat_Sheet.html).
+
+### Approachable explanations and implementation references
+
+- ByteByteGo, [Session vs JWT: The Differences You May Not Know](https://www.youtube.com/watch?v=fyTxwIa-1U0), a visual introduction to the stateful-session and self-contained-token tradeoff.
+- ByteByteGo, [Session, Cookie, JWT, Token, SSO, and OAuth](https://blog.bytebytego.com/p/ep34-session-cookie-jwt-token-sso), a concise vocabulary overview.
+- Auth0, [What Are Refresh Tokens and How to Use Them Securely](https://auth0.com/blog/refresh-tokens-what-are-they-and-when-to-use-them/), an approachable explanation of rotation and token families. For implementation choices, prefer the newer RFC 9700 and RFC 10017 guidance above.
+- AWS, [Security Best Practices for Amazon Cognito User Pools](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-security-best-practices.html).
+- Google, [Manage Session Cookies with Firebase Authentication](https://firebase.google.com/docs/auth/admin/manage-cookies).
+- Okta, [Refresh Access Tokens and Rotate Refresh Tokens](https://developer.okta.com/docs/guides/refresh-tokens/main/).
+- Apple, [Authenticating a User Through a Web Service](https://developer.apple.com/documentation/authenticationservices/authenticating-a-user-through-a-web-service).
+- Android Developers, [Android Keystore System](https://developer.android.com/privacy-and-security/keystore).
