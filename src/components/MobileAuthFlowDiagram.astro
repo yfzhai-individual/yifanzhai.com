@@ -1,0 +1,478 @@
+---
+interface Actor {
+  title: string;
+  subtitle: string;
+}
+
+interface FlowStep {
+  stage: 1 | 2 | 3;
+  from: number;
+  to: number;
+  label: string;
+  kind?: 'request' | 'response' | 'token' | 'api';
+}
+
+const componentId = 'native-mobile-auth-flow';
+const actors: Actor[] = [
+  { title: 'Mobile app', subtitle: 'keeps PKCE verifier' },
+  { title: 'Browser + OS', subtitle: 'keeps IdP cookie' },
+  { title: 'Identity provider', subtitle: 'authorize + token' },
+  { title: 'Protected API', subtitle: 'resource server' },
+];
+
+const steps: FlowStep[] = [
+  { stage: 1, from: 0, to: 1, label: 'Open authorization URL' },
+  { stage: 1, from: 1, to: 2, label: 'Challenge + state + nonce' },
+  { stage: 1, from: 2, to: 2, label: 'Authenticate or reuse SSO', kind: 'response' },
+  { stage: 2, from: 2, to: 1, label: 'Redirect: code + state', kind: 'response' },
+  { stage: 2, from: 1, to: 0, label: 'OS opens verified app link', kind: 'response' },
+  { stage: 2, from: 0, to: 2, label: 'Code + original verifier', kind: 'request' },
+  { stage: 2, from: 2, to: 0, label: 'ID + access tokens (+ refresh)', kind: 'token' },
+  { stage: 3, from: 0, to: 0, label: 'Validate OIDC response', kind: 'token' },
+  { stage: 3, from: 0, to: 3, label: 'Bearer access token', kind: 'api' },
+  { stage: 3, from: 3, to: 0, label: 'Protected data', kind: 'response' },
+];
+
+const stages = [
+  {
+    id: 1,
+    label: 'Authorize in browser',
+    viewBox: '0 0 768 280',
+    summary: 'The app keeps the PKCE verifier. The system browser handles the identity-provider login and keeps its SSO cookie.',
+  },
+  {
+    id: 2,
+    label: 'Return & exchange',
+    viewBox: '0 0 768 458',
+    summary: 'The operating system routes the one-time code back to the registered app. The code cannot be redeemed without the original verifier.',
+  },
+  {
+    id: 3,
+    label: 'Call the API',
+    viewBox: '0 0 768 606',
+    summary: 'The app validates the OIDC login response, then sends only the access token intended for the protected API.',
+  },
+] as const;
+
+const actorCenters = [84, 284, 484, 684];
+const actorWidth = 158;
+const actorY = 18;
+const actorHeight = 66;
+const firstStepY = 128;
+const stepGap = 48;
+const neutralMarkerId = `${componentId}-arrow-neutral`;
+const accentMarkerId = `${componentId}-arrow-accent`;
+---
+
+<section id={componentId} class="mobile-auth-flow" data-mobile-auth-flow>
+  <header class="mobile-auth-flow__header">
+    <p class="mobile-auth-flow__title">Native login leaves the app, then safely returns</p>
+    <p class="mobile-auth-flow__description">Follow the authorization code from the app, through the system browser, and back to the API.</p>
+  </header>
+
+  <div class="mobile-auth-flow__stages" role="group" aria-label="Show the native login flow by phase">
+    {stages.map((stage, index) => (
+      <button
+        type="button"
+        aria-pressed={index === 0 ? 'true' : 'false'}
+        data-mobile-stage-button={stage.id}
+      >
+        <span aria-hidden="true">{stage.id}</span>
+        {stage.label}
+      </button>
+    ))}
+  </div>
+
+  <div class="mobile-auth-flow__canvas" tabindex="0" aria-label="Native application authorization sequence diagram">
+    <svg
+      viewBox={stages[0].viewBox}
+      role="img"
+      aria-labelledby={`${componentId}-title ${componentId}-description`}
+      data-mobile-flow-svg
+    >
+      <title id={`${componentId}-title`}>Native application authorization code flow with PKCE</title>
+      <desc id={`${componentId}-description`}>The mobile app opens the identity provider in the system browser, receives a one-time code through an operating-system verified link, exchanges it with the PKCE verifier, validates the login response, and calls the API with an access token.</desc>
+
+      <defs>
+        <marker id={neutralMarkerId} markerWidth="8" markerHeight="8" refX="7.2" refY="4" orient="auto" markerUnits="strokeWidth">
+          <path d="M 0 0 L 8 4 L 0 8 z" class="mobile-auth-flow__marker-neutral" />
+        </marker>
+        <marker id={accentMarkerId} markerWidth="8" markerHeight="8" refX="7.2" refY="4" orient="auto" markerUnits="strokeWidth">
+          <path d="M 0 0 L 8 4 L 0 8 z" class="mobile-auth-flow__marker-accent" />
+        </marker>
+      </defs>
+
+      {actors.map((actor, actorIndex) => {
+        const centerX = actorCenters[actorIndex];
+        return (
+          <g class="mobile-auth-flow__actor">
+            <rect x={centerX - actorWidth / 2} y={actorY} width={actorWidth} height={actorHeight} rx="10" />
+            <text class="mobile-auth-flow__actor-title" x={centerX} y={actorY + 27} text-anchor="middle">{actor.title}</text>
+            <text class="mobile-auth-flow__actor-subtitle" x={centerX} y={actorY + 48} text-anchor="middle">{actor.subtitle}</text>
+            <line x1={centerX} y1={actorY + actorHeight} x2={centerX} y2="586" />
+          </g>
+        );
+      })}
+
+      {steps.map((step, stepIndex) => {
+        const y = firstStepY + stepIndex * stepGap;
+        const fromX = actorCenters[step.from];
+        const toX = actorCenters[step.to];
+        const selfDirected = step.from === step.to;
+        const labelWidth = Math.max(106, Math.min(224, step.label.length * 6.15 + 20));
+        const labelX = selfDirected ? fromX + 70 : (fromX + toX) / 2;
+        const labelY = y - 10;
+        const path = selfDirected
+          ? `M ${fromX} ${y} C ${fromX + 64} ${y}, ${fromX + 64} ${y + 30}, ${fromX} ${y + 30}`
+          : `M ${fromX} ${y} L ${toX} ${y}`;
+        const accent = step.kind === 'token' || step.kind === 'api';
+
+        return (
+          <g
+            class:list={[
+              'mobile-auth-flow__step',
+              `mobile-auth-flow__step--${step.kind ?? 'request'}`,
+              step.stage > 1 && 'is-future',
+            ]}
+            data-mobile-min-stage={step.stage}
+            aria-hidden={step.stage > 1 ? 'true' : 'false'}
+          >
+            <path d={path} marker-end={`url(#${accent ? accentMarkerId : neutralMarkerId})`} />
+            <circle cx={fromX} cy={y} r="12" />
+            <text class="mobile-auth-flow__step-number" x={fromX} y={y + 4} text-anchor="middle">{stepIndex + 1}</text>
+            <g class="mobile-auth-flow__step-label" transform={`translate(${labelX} ${labelY})`}>
+              <rect x={-labelWidth / 2} y="-12" width={labelWidth} height="21" rx="4" />
+              <text x="0" y="2" text-anchor="middle">{step.label}</text>
+            </g>
+          </g>
+        );
+      })}
+    </svg>
+  </div>
+
+  <ol class="mobile-auth-flow__compact" aria-label="Native application authorization steps">
+    {steps.map((step, stepIndex) => (
+      <li class:list={[step.stage > 1 && 'is-future']} data-mobile-min-stage={step.stage} aria-hidden={step.stage > 1 ? 'true' : 'false'}>
+        <span class="mobile-auth-flow__compact-number" aria-hidden="true">{stepIndex + 1}</span>
+        <p class="mobile-auth-flow__compact-route">
+          {actors[step.from].title}
+          <span aria-hidden="true">→</span>
+          {actors[step.to].title}
+        </p>
+        <p class="mobile-auth-flow__compact-label">{step.label}</p>
+      </li>
+    ))}
+  </ol>
+
+  <div class="mobile-auth-flow__summary" aria-live="polite">
+    <p class="mobile-auth-flow__summary-label" data-mobile-summary-label>Phase 1 · Authorize in browser</p>
+    <p data-mobile-summary>{stages[0].summary}</p>
+  </div>
+</section>
+
+<script>
+  const mobileAuthStages = [
+    {
+      id: 1,
+      label: 'Authorize in browser',
+      viewBox: '0 0 768 280',
+      summary: 'The app keeps the PKCE verifier. The system browser handles the identity-provider login and keeps its SSO cookie.',
+    },
+    {
+      id: 2,
+      label: 'Return & exchange',
+      viewBox: '0 0 768 458',
+      summary: 'The operating system routes the one-time code back to the registered app. The code cannot be redeemed without the original verifier.',
+    },
+    {
+      id: 3,
+      label: 'Call the API',
+      viewBox: '0 0 768 606',
+      summary: 'The app validates the OIDC login response, then sends only the access token intended for the protected API.',
+    },
+  ] as const;
+
+  const setupMobileAuthFlow = () => {
+    document.querySelectorAll<HTMLElement>('[data-mobile-auth-flow]:not([data-mobile-flow-ready])').forEach((root) => {
+      const buttons = [...root.querySelectorAll<HTMLButtonElement>('[data-mobile-stage-button]')];
+      const progressiveSteps = [...root.querySelectorAll<SVGElement | HTMLElement>('[data-mobile-min-stage]')];
+      const svg = root.querySelector<SVGSVGElement>('[data-mobile-flow-svg]');
+      const summaryLabel = root.querySelector<HTMLElement>('[data-mobile-summary-label]');
+      const summary = root.querySelector<HTMLElement>('[data-mobile-summary]');
+
+      const selectStage = (stageId: number) => {
+        const selected = mobileAuthStages.find((stage) => stage.id === stageId) ?? mobileAuthStages[0];
+
+        buttons.forEach((button) => {
+          button.setAttribute('aria-pressed', String(Number(button.dataset.mobileStageButton) === selected.id));
+        });
+        progressiveSteps.forEach((step) => {
+          const future = Number(step.getAttribute('data-mobile-min-stage')) > selected.id;
+          step.classList.toggle('is-future', future);
+          step.setAttribute('aria-hidden', String(future));
+        });
+        svg?.setAttribute('viewBox', selected.viewBox);
+        if (summaryLabel) summaryLabel.textContent = `Phase ${selected.id} · ${selected.label}`;
+        if (summary) summary.textContent = selected.summary;
+      };
+
+      buttons.forEach((button) => {
+        button.addEventListener('click', () => selectStage(Number(button.dataset.mobileStageButton ?? 1)));
+      });
+      root.dataset.mobileFlowReady = 'true';
+    });
+  };
+
+  setupMobileAuthFlow();
+  document.addEventListener('astro:page-load', setupMobileAuthFlow);
+</script>
+
+<style>
+  .mobile-auth-flow {
+    margin-block: 2rem;
+    color: var(--text);
+  }
+
+  .mobile-auth-flow__header {
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .mobile-auth-flow__title {
+    color: var(--text) !important;
+    font-family: var(--serif);
+    font-size: 1.35rem;
+    font-weight: 500;
+    line-height: 1.2;
+  }
+
+  .mobile-auth-flow__description {
+    margin-top: .35rem;
+    color: var(--muted) !important;
+    font-size: .92rem;
+  }
+
+  .mobile-auth-flow__stages {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .55rem;
+    margin-block: 1rem;
+  }
+
+  .mobile-auth-flow__stages button {
+    display: inline-flex;
+    gap: .5rem;
+    align-items: center;
+    min-height: 2.35rem;
+    padding: .48rem .72rem;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--muted);
+    font: 600 .72rem/1.2 var(--mono);
+    cursor: pointer;
+    transition: border-color 160ms ease, background 160ms ease, color 160ms ease;
+  }
+
+  .mobile-auth-flow__stages button span {
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .mobile-auth-flow__stages button:hover {
+    border-color: var(--faint);
+    color: var(--text);
+  }
+
+  .mobile-auth-flow__stages button[aria-pressed='true'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--text);
+  }
+
+  .mobile-auth-flow__stages button:focus-visible,
+  .mobile-auth-flow__canvas:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .mobile-auth-flow__canvas {
+    overflow-x: auto;
+    border-block: 1px solid var(--line);
+    background: color-mix(in srgb, var(--surface) 55%, transparent);
+    scrollbar-color: var(--faint) transparent;
+  }
+
+  .mobile-auth-flow__canvas svg {
+    display: block;
+    width: 100%;
+    min-width: 700px;
+    height: auto;
+  }
+
+  .mobile-auth-flow__actor rect {
+    fill: var(--bg);
+    stroke: var(--line);
+    stroke-width: 1.2;
+  }
+
+  .mobile-auth-flow__actor line {
+    stroke: var(--line);
+    stroke-width: 1;
+    stroke-dasharray: 4 7;
+  }
+
+  .mobile-auth-flow__actor-title {
+    fill: var(--text);
+    font-family: var(--serif);
+    font-size: 15px;
+    font-weight: 500;
+  }
+
+  .mobile-auth-flow__actor-subtitle {
+    fill: var(--muted);
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: .02em;
+  }
+
+  .mobile-auth-flow__step path {
+    fill: none;
+    stroke: var(--faint);
+    stroke-width: 1.45;
+  }
+
+  .mobile-auth-flow__step--response path {
+    stroke-dasharray: 5 4;
+  }
+
+  .mobile-auth-flow__step--token path,
+  .mobile-auth-flow__step--api path {
+    stroke: var(--accent);
+  }
+
+  .mobile-auth-flow__step circle {
+    fill: var(--bg);
+    stroke: var(--accent);
+    stroke-width: 1.5;
+  }
+
+  .mobile-auth-flow__step-number {
+    fill: var(--accent);
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+  }
+
+  .mobile-auth-flow__step-label rect {
+    fill: var(--bg);
+  }
+
+  .mobile-auth-flow__step-label text {
+    fill: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+
+  .mobile-auth-flow__marker-neutral {
+    fill: var(--faint);
+  }
+
+  .mobile-auth-flow__marker-accent {
+    fill: var(--accent);
+  }
+
+  .mobile-auth-flow__compact {
+    display: none;
+  }
+
+  .mobile-auth-flow__summary {
+    margin-top: 1rem;
+    padding: 1rem 1.1rem;
+    border-left: 2px solid var(--accent);
+    background: var(--surface);
+  }
+
+  .mobile-auth-flow__summary-label {
+    margin-bottom: .35rem;
+    color: var(--accent) !important;
+    font-family: var(--mono);
+    font-size: .68rem;
+    font-weight: 650;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+
+  .mobile-auth-flow__summary p:last-child {
+    color: var(--text) !important;
+    font-size: .9rem;
+  }
+
+  .mobile-auth-flow .is-future {
+    display: none;
+  }
+
+  @media (max-width: 42rem) {
+    .mobile-auth-flow__stages {
+      display: grid;
+    }
+
+    .mobile-auth-flow__stages button {
+      justify-content: flex-start;
+      min-height: 2.75rem;
+      border-radius: .3rem;
+    }
+
+    .mobile-auth-flow__canvas {
+      display: none;
+    }
+
+    .mobile-auth-flow__compact {
+      display: grid;
+      gap: 0;
+      padding: .25rem 0 .25rem 2.5rem;
+      margin: 0;
+      list-style: none;
+      border-block: 1px solid var(--line);
+    }
+
+    .mobile-auth-flow__compact li {
+      position: relative;
+      padding: .9rem 0 .9rem 1rem;
+      border-left: 1px solid var(--line);
+    }
+
+    .mobile-auth-flow__compact-number {
+      position: absolute;
+      top: 1rem;
+      left: -1.05rem;
+      display: grid;
+      width: 2rem;
+      height: 2rem;
+      place-items: center;
+      border: 1px solid var(--accent);
+      border-radius: 50%;
+      background: var(--bg);
+      color: var(--accent);
+      font: 600 .68rem/1 var(--mono);
+    }
+
+    .mobile-auth-flow__compact-route {
+      color: var(--muted) !important;
+      font: 600 .66rem/1.4 var(--mono);
+      letter-spacing: .02em;
+      text-transform: uppercase;
+    }
+
+    .mobile-auth-flow__compact-route span {
+      padding-inline: .3rem;
+      color: var(--accent);
+    }
+
+    .mobile-auth-flow__compact-label {
+      margin-top: .2rem;
+      color: var(--text) !important;
+      font-size: .9rem;
+    }
+  }
+</style>
