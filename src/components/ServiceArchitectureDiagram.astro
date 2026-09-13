@@ -22,7 +22,12 @@ const initialViewBox = diagram.stages[0]?.viewBox ?? diagram.viewBox;
     <p class="service-architecture__description">{diagram.description}</p>
   </header>
 
-  <div class="service-architecture__stages" role="group" aria-label="Architecture layers">
+  <div
+    class="service-architecture__stages"
+    role="group"
+    aria-label="Architecture layers"
+    hidden={diagram.stages.length === 1}
+  >
     {diagram.stages.map((stage, index) => (
       <button
         type="button"
@@ -340,6 +345,10 @@ const initialViewBox = diagram.stages[0]?.viewBox ?? diagram.viewBox;
     flex-wrap: wrap;
     gap: .5rem;
     margin-top: 1rem;
+  }
+
+  .service-architecture__stages[hidden] {
+    display: none;
   }
 
   .service-architecture__stages button {
