@@ -1,0 +1,103 @@
+---
+title: "MFA Is More Than a Second Prompt"
+description: "A practical guide to choosing MFA, understanding phishing resistance, and securing enrollment, recovery, step-up authentication, and the session that follows."
+publishedAt: 2026-09-24
+tags: [security, authentication, MFA]
+draft: false
+---
+
+import Callout from '../../components/Callout.astro';
+
+The [previous authentication guide](https://yifanzhai.com/writing/access-tokens-refresh-tokens-and-sessions/) followed a login from passwords and passkeys through sessions, tokens, OAuth, OpenID Connect (OIDC), and Single Sign-On (SSO). One practical question remained: when is one login factor not enough, and which second factor actually helps?
+
+The shortest useful mental model is:
+
+> Multi-Factor Authentication (MFA) raises confidence in an authentication event. Its value depends on factor independence, resistance to the attack you expect, and the security of enrollment and recovery.
+
+MFA does not decide what the identity may do, and it does not make the session created after login impossible to steal.
+
+## MFA is about independent factors, not extra screens
+
+Authentication factors are conventionally grouped as:
+
+- **Something you know:** a password or Personal Identification Number (PIN).
+- **Something you have:** a phone, hardware security key, smart card, or device-held private key.
+- **Something you are:** a biometric characteristic such as a fingerprint or face.
+
+MFA requires evidence from at least two distinct factor categories. Two passwords are still one knowledge factor. A password followed by a security question is also one factor, only repeated in a weaker form.
+
+A passkey can satisfy two factors in one ceremony when the user proves possession of a device-held private key and unlocks it locally with a PIN or biometric. The biometric normally stays on the device; the server receives a signed cryptographic response and an indication that local user verification occurred.
+
+<Callout type="info" title="Two-step verification is not always MFA">
+Two screens describe the user experience. Two independent factors describe the security property. Ask what secret or key each step proves, where it is stored, and whether compromising one system also compromises the other.
+</Callout>
+
+## Choose the factor for the attack you expect
+
+Every additional factor improves some threats and leaves others mostly unchanged.
+
+| Method | What it adds | What it handles well | Important weakness |
+| --- | --- | --- | --- |
+| SMS or voice code | Control of a phone number | Password reuse and basic credential stuffing | Phishing, SIM swap, number porting, telecom recovery, delivery failures |
+| Time-based One-Time Password (TOTP) | Possession of an authenticator seed | Password database leaks and automated password attacks | A fake site can relay the current code in real time |
+| Push approval | Control of an enrolled app or device | Convenient second-factor approval | Blind approval enables MFA fatigue or “push bombing” |
+| Push with number matching | Device possession plus transaction participation | Reduces accidental and fatigue-based approval | Still depends on user attention and is not origin-bound like WebAuthn |
+| Passkey or FIDO2 security key | Origin-bound public-key proof, usually unlocked locally | Phishing, replay, credential stuffing, and verifier password leaks | Enrollment, device loss, synchronization policy, and recovery need careful design |
+| Smart card or hardware-backed client certificate | Possession of a protected private key, often activated by PIN | High-assurance workforce and administrator authentication | PKI lifecycle, hardware distribution, middleware, and recovery are operationally expensive |
+
+The conclusion is not “SMS is useless.” For a public service whose users cannot adopt passkeys, SMS can be materially better than a password alone. But the [current NIST guidance](https://pages.nist.gov/800-63-4/sp800-63b.html) treats the public telephone network as a restricted authenticator and requires organizations in its scope to offer an alternative. Email is useful for address verification and some recovery flows, but NIST does not accept email as an out-of-band authentication channel.
+
+TOTP and ordinary push also are not **phishing-resistant**. A reverse-proxy phishing site can relay a password and one-time code to the real service, then steal the resulting session. Phishing resistance means the protocol itself prevents a valid response from being used by an impostor verifier; it does not depend on the user noticing a slightly wrong domain. Properly configured WebAuthn achieves this by binding the credential to the relying party's domain.
+
+## MFA is a lifecycle
+
+A production design has to secure more than the successful prompt:
+
+1. **Enroll:** Bind the new authenticator only after strong proof through an existing factor, controlled bootstrap process, or identity proofing. Record when and how it was added.
+2. **Authenticate:** Verify the required factors, rate-limit failures and prompts, and create a session with the resulting assurance context.
+3. **Step up:** Ask for fresh authentication before high-risk actions such as changing factors, exporting secrets, modifying payment details, or using administrator privileges.
+4. **Recover:** Replace lost authenticators through a process appropriate to the account's risk. Revoke old factors and sessions, and notify the user through existing channels.
+5. **Retire:** Remove authenticators when devices or employees leave; do not let unused credentials live indefinitely.
+
+The enrollment and recovery paths deserve the same scrutiny as login. If an attacker can call support, change the phone number, and register a new authenticator using weak evidence, the strongest hardware key protects only the front door.
+
+Useful recovery controls include multiple pre-enrolled authenticators, single-use recovery codes stored as hashes, verified recovery contacts, delays for high-value accounts, strong help-desk procedures, and notifications on every factor change. Requiring an existing factor before adding a new one prevents a stolen session by itself from silently replacing MFA.
+
+<Callout type="warning" title="MFA does not protect a stolen authenticated session">
+Once MFA succeeds, most web applications issue a session cookie or tokens. Malware, Cross-Site Scripting (XSS), or a reverse-proxy phishing kit may steal or operate that session after authentication. Keep sessions appropriately short, detect suspicious reuse, and require the actual authenticator again for sensitive step-up actions.
+</Callout>
+
+## Apply stronger authentication where the risk justifies it
+
+Prompting on every click is both unusable and counterproductive. A common design is:
+
+- Use a strong baseline method for login.
+- Evaluate risk signals such as a new device, unusual network, impossible travel, breached credentials, or an administrative action.
+- Require step-up authentication, limit the action, or deny the request when risk rises.
+- Preserve the method, time, and assurance of the authentication in the server-side session.
+
+Device reputation, IP address, location, and behavior can inform a decision, but they are not automatically new authentication factors. They can be noisy, spoofed, privacy-sensitive, and biased against users who travel or share networks.
+
+NIST expresses authentication strength using **Authentication Assurance Levels (AALs)**:
+
+- **AAL1** permits a single factor.
+- **AAL2** requires two distinct factors and requires a phishing-resistant option to be offered under NIST's current rules.
+- **AAL3** requires phishing-resistant public-key authentication with a non-exportable private key in a hardware-protected environment, plus an activation factor or separate password.
+
+AALs are useful vocabulary, especially in regulated and government systems. They are not a reason to declare every consumer feature “AAL2.” Start with the threats and consequences, then determine the evidence, recovery, session, and audit controls required.
+
+## A practical default
+
+For a consumer application, offer passkeys and support a well-protected password plus an appropriate second factor where passkey adoption is incomplete. For employees, administrators, and high-value accounts, prefer phishing-resistant, hardware-backed authentication and enroll at least two recovery-capable authenticators.
+
+Whatever the factor, design enrollment, recovery, session handling, monitoring, and emergency access at the same time. The strongest ceremony paired with weak recovery is a weak system.
+
+The companion [Authentication Security Interview Question Bank](https://yifanzhai.com/writing/authentication-security-interview-question-bank/) collects the highest-value architecture questions and trade-offs across MFA, sessions, tokens, federation, and PKI.
+
+## References and further reading
+
+- National Institute of Standards and Technology, [SP 800-63B-4: Authentication and Authenticator Management](https://pages.nist.gov/800-63-4/sp800-63b.html).
+- OWASP, [Multifactor Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Multifactor_Authentication_Cheat_Sheet.html).
+- Cybersecurity and Infrastructure Security Agency, [Implementing Phishing-Resistant MFA](https://www.cisa.gov/sites/default/files/2023-01/fact-sheet-implementing-phishing-resistant-mfa-508c.pdf).
+- Cybersecurity and Infrastructure Security Agency, [Implementing Number Matching in MFA Applications](https://www.cisa.gov/sites/default/files/publications/fact-sheet-implement-number-matching-in-mfa-applications-508c.pdf).
+- World Wide Web Consortium, [Web Authentication: An API for Accessing Public Key Credentials](https://www.w3.org/TR/webauthn-3/).

@@ -1,7 +1,8 @@
 ---
 title: "How Modern Web Authentication Fits Together"
-description: "A start-to-finish guide to passwords, passkeys, sessions, JWTs, OAuth, OIDC, SSO, browser token storage, and the security tradeoffs interviewers expect you to explain."
+description: "A start-to-finish guide to passwords, passkeys, sessions, JWTs, OAuth, OIDC, SSO, browser and mobile token storage, and the trust boundaries connecting them."
 publishedAt: 2026-09-12
+updatedAt: 2026-09-24
 tags: [security, authentication, OAuth, web]
 draft: false
 ---
@@ -752,131 +753,9 @@ Then ask:
 
 The goal is not to maximize token types. It is to minimize the number of bearer credentials, the components that can read them, their authority, and the time they remain useful.
 
-## Interview questions and concise answers
+## Continue with the interview question bank
 
-### Is HTTP Basic authentication encrypted because it uses Base64?
-
-No. Base64 is reversible encoding. Basic authentication repeatedly sends a password-equivalent value, so TLS is mandatory; the design still has credential caching, replay, and logout limitations that make it a poor default for modern human login.
-
-### Should the browser hash or encrypt a password before sending it?
-
-Do not invent an application-layer substitute for HTTPS. A stable client-side hash becomes a replayable password equivalent, while custom encryption creates a key-distribution problem. Send the password through an authenticated TLS connection and store only a salted, slow password-KDF verifier on the server.
-
-### Why hash passwords instead of encrypting them?
-
-Encryption is reversible and requires a decryption key; compromise of that key reveals every password. Password verification does not need the original value. A salted, deliberately expensive KDF such as Argon2id makes each offline guess costly and lets the server compare verifiers without recovering the password.
-
-### Do passkeys remove the need for sessions?
-
-No. A passkey changes the authentication ceremony from a shared secret to an origin-bound public-key proof. After the proof succeeds, a web application still needs a session credential for subsequent HTTP requests.
-
-### Is a passkey authenticator an online service or a local trust store?
-
-Neither description is universally correct. It is the cryptographic component reached through the browser or operating system: it may be built into the device, be a separate security key or nearby phone, or use a protected passkey provider that synchronizes credentials. The website stores the public key and receives signed assertions; it never receives the private key or the biometric used to unlock it.
-
-### Is an API key the same as a user access token?
-
-Usually not. An API key commonly identifies a calling application or project and may carry static bearer authority. A user access token represents a delegated grant for a particular subject, client, audience, scope, and lifetime. Some products name credentials differently, so follow the issuer's security contract rather than the label alone.
-
-### Session or JWT—which should I use?
-
-That question mixes purpose with format. For one browser and its backend, a server-side session is a strong default when central revocation and fresh state matter. A JWT is useful when recipients need portable signed claims and local validation. A session can itself be represented by a JWT, so begin with trust boundaries and lifecycle rather than the format.
-
-### Do JWTs scale better than sessions?
-
-They can remove a session-store lookup from the request path, but they add key distribution, revocation, claim freshness, and larger-request costs. Server sessions scale with shared or distributed stores. The correct answer is a tradeoff analysis, not “JWT is stateless, therefore it scales.”
-
-### Is a JWT encrypted?
-
-Usually not. A normal JWS protects integrity and authenticity, while its payload remains readable. JWE provides encryption. Do not put secrets in a JWT merely because it is signed.
-
-### Is every JWT a bearer token? Is every bearer token a JWT?
-
-No to both. JWT is a format, while bearer is a usage model in which possession is sufficient. A bearer token can be opaque or JWT-formatted; a JWT can be an access token, ID token, session object, or another signed claim set. Identify the credential's purpose and validation profile before accepting it.
-
-### Can a JWT be stored in a cookie?
-
-Yes. JWT is a format and cookie is a browser delivery mechanism. Doing so creates cookie-related requirements such as CSRF defenses, cookie size limits, and secure attributes; it does not automatically make the design safe or unsafe.
-
-### JWT or opaque access token?
-
-Use a JWT when independent local validation and interoperability are worth the revocation and stale-claim tradeoffs. Use an opaque token when centralized introspection, claim concealment, and immediate control matter more. Follow the issuer's contract; do not parse a vendor token simply because it resembles a JWT.
-
-### Cookies or `localStorage` for browser credentials?
-
-An `HttpOnly` cookie prevents JavaScript from directly reading the credential but is sent automatically, so it needs CSRF protection. `localStorage` is not sent automatically, but every same-origin script can read and export its persistent contents. For sensitive applications, prefer a BFF with an `HttpOnly` session cookie and server-side token storage. A browser-only client should minimize authority and persistence, preferably keeping short-lived access tokens in memory.
-
-### Does `HttpOnly` prevent XSS?
-
-No. It prevents JavaScript from reading the cookie value. Injected code can still make authenticated requests from the victim's browser.
-
-### What is the difference between an access token and an ID token?
-
-The access token is intended for the resource server and carries API authority. The ID token is intended for the OIDC client and carries claims about authentication. An API must not accept an ID token as an access token.
-
-### After OIDC login, what credential should the browser receive?
-
-In a server-backed web application or BFF design, the backend validates the OIDC response, maps the external subject to a local account, and gives the browser a hardened application-session cookie. It keeps access and refresh tokens server-side. A browser-only SPA receives an access token only when it must call the API directly; that is a different architecture with greater browser exposure.
-
-### Is “Sign in with Google” OAuth or OIDC?
-
-The login use case is OIDC, an identity layer built on OAuth. “Connect Google Drive” is OAuth authorization: the resulting access token goes to the Drive API. “Sign in with Google” uses a validated ID token to establish identity, after which your application creates its own session. Both may use an authorization code, but their outputs and recipients are different.
-
-### Why are access tokens short-lived if refresh tokens live longer?
-
-The API sees only a narrow, short-lived credential. The more powerful renewal credential remains at the authorization-server boundary, where the client can protect it and the server can rotate, expire, or revoke it.
-
-### How does refresh-token rotation detect theft?
-
-The authorization server invalidates the old token after use but remembers its family. Reuse of an older family member suggests that two parties possess the credential, so the server revokes the active family and requires fresh authorization.
-
-### Is a refresh token also a JWT?
-
-It can be, but it does not have to be. Refresh token describes the credential's purpose, while JWT describes a format. The client should treat both opaque and JWT-formatted refresh tokens as secrets, send them only to the authorization server, and avoid depending on decoded claims. JWT formatting does not remove the server-side state needed for rotation, reuse detection, or revocation.
-
-### Does PKCE protect access tokens?
-
-No. PKCE protects the authorization code from interception or injection during the code exchange. It does not prevent theft or replay of a token after issuance.
-
-### Is an installed mobile app a confidential OAuth client?
-
-Normally no. Code and static secrets distributed in an application package can be extracted, so the app is treated as a public client. PKCE protects its authorization-code exchange; it does not turn the app into a confidential client. A separate backend can be confidential because its credentials remain on the server.
-
-### Should a mobile app authenticate inside a WebView?
-
-Not for OAuth or OIDC with an external provider. Use the system browser or a browser-controlled authentication session so the app cannot inspect credentials or IdP cookies and the user can reuse the browser's SSO session.
-
-### What is the difference between a WebView and an in-app browser tab?
-
-A WebView is a rendering component controlled by the host app, which may be able to inspect or modify content and cookies. An in-app browser tab is controlled by the browser or operating system even though it appears inside the app. The host app can start the navigation and receive the registered callback, but it cannot read the identity-provider login page or cookie jar.
-
-### Where should a mobile app store refresh tokens?
-
-Only persist one when continued access is required. Use application-isolated OS protection such as Apple Keychain or Keystore-backed encryption on Android, rotate or sender-constrain the token, limit its lifetime, and keep it out of logs and backups. Protected storage reduces extraction; it cannot make a compromised process trustworthy.
-
-### How do I revoke a JWT immediately?
-
-Expiration alone cannot provide immediate revocation. Add a stateful check such as introspection, a deny list, a session or grant version, or an authorization gateway—or accept a bounded delay by using a sufficiently short lifetime.
-
-### What is the difference between CSRF and XSS in this design?
-
-CSRF abuses the browser's automatic credential sending to issue unwanted requests. XSS runs attacker-controlled code inside the trusted origin. `SameSite` and CSRF tokens primarily address CSRF; output encoding, safe templating, Content Security Policy, dependency hygiene, and avoiding dangerous browser APIs reduce XSS. Neither defense substitutes for resource-level authorization.
-
-### What should happen during logout?
-
-Invalidate the local session, clear its cookie, revoke the refresh token or grant when appropriate, and decide whether already-issued access tokens need immediate denial or may expire. Be explicit about whether logout is local, identity-provider-wide, or global across devices.
-
-### Is SSO a protocol?
-
-No. SSO is the experience of authenticating once and reaching multiple applications. OIDC and SAML 2.0 are federation protocols that can deliver that experience; Kerberos and other systems can do so as well.
-
-### Does SSO mean every application shares one session cookie?
-
-No. The IdP keeps an IdP-domain session. Each application redirects to the IdP, validates a response intended for itself, and creates its own local session. Cookie scoping and separate audiences preserve those boundaries.
-
-### What is the difference between SSO, federation, and provisioning?
-
-SSO describes the reduced-prompt user experience. Federation is the trust and protocol exchange through which an IdP sends an assertion to a relying party. Provisioning creates, updates, and removes application accounts and entitlements—often through SCIM—and must not be assumed to happen merely because login federation works.
+The companion [Authentication Security Interview Question Bank](https://yifanzhai.com/writing/authentication-security-interview-question-bank/) consolidates the highest-frequency architecture questions and trade-offs across sessions, tokens, OAuth, MFA, federation, and PKI. It is intentionally curated rather than repeating every definition in this guide as a question.
 
 ## The short answer
 

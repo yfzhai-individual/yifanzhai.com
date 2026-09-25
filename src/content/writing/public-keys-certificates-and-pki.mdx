@@ -1,0 +1,197 @@
+---
+title: "From Public Keys to PKI: How Certificates Create Trust"
+description: "A practical path from private and public keys through PEM, certificates, proof of possession, trust chains, public and private CAs, mTLS, and certificate lifecycle."
+publishedAt: 2026-09-24
+tags: [security, PKI, certificates, TLS]
+draft: false
+---
+
+import Callout from '../../components/Callout.astro';
+import ServiceArchitectureDiagram from '../../components/ServiceArchitectureDiagram.astro';
+import { pkiTrustArchitecture } from '../../data/architecture-diagrams';
+
+Public-key cryptography can prove that a particular key signed some data. It cannot, by itself, tell a browser that the key belongs to `api.example.com`, or tell a service that the key belongs to an approved production workload.
+
+To understand how that trust is added, start with three concrete objects: a private key, a public key, and a certificate.
+
+## Private key, public key, and certificate
+
+A **key pair** is two mathematically related keys generated together.
+
+| Object | What it contains | Secret? | Main job |
+| --- | --- | --- | --- |
+| Private key | Secret key material, such as an elliptic-curve scalar or RSA private values | Yes—do not transmit it | Sign, derive, or decrypt, depending on the algorithm and protocol |
+| Public key | The algorithm and public values, such as an elliptic-curve point or RSA modulus | No | Verify signatures or support key agreement or encryption, depending on the protocol |
+| X.509 certificate | An identity, the subject's public key, issuer, lifetime, constraints, and the issuer's signature | No | Bind a public key to an identity under the issuer's policy |
+
+The relationship is one-way: a certificate contains a public key, but never the corresponding private key. A bare public key says “this key verifies this signature.” A certificate adds “this issuer says this key belongs to `api.example.com` until this date, for these uses.”
+
+In modern Transport Layer Security (TLS), the certificate is primarily part of authentication. Do not reduce the explanation to “the certificate encrypts HTTPS.” TLS 1.3 normally uses the certificate's key to authenticate the peer, a separate ephemeral key agreement to establish fresh symmetric keys, and fast symmetric encryption for the application data. The earlier [TLS walkthrough](https://yifanzhai.com/writing/how-tls-encrypts-http/) follows the complete handshake.
+
+## What do these files look like?
+
+In command-line and configuration workflows, keys and certificates are often stored as **Privacy-Enhanced Mail (PEM)** files:
+
+```text
+-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASC...shortened...
+-----END PRIVATE KEY-----
+
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A...shortened...
+-----END PUBLIC KEY-----
+
+-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAJ...shortened...
+-----END CERTIFICATE-----
+```
+
+PEM is an envelope, not an encryption scheme. The body is Base64-encoded binary **Distinguished Encoding Rules (DER)** data between labels. Base64 makes binary data easier to store and copy; it provides no secrecy. A private-key PEM can be password-encrypted, but the label and encryption metadata—not Base64—provide that protection.
+
+PEM also is not the only representation. TLS normally carries DER-encoded certificates on the wire; APIs may expose public keys as JSON Web Keys (JWKs); and a Hardware Security Module (HSM), Trusted Platform Module (TPM), or cloud Key Management Service (KMS) may keep a private key non-exportable so no private-key file exists at all.
+
+Simply Base64-decoding a certificate produces binary ASN.1 data, not readable JSON. A certificate parser renders that structure approximately like this:
+
+```text
+Certificate:
+  Data:
+    Version: 3
+    Serial Number: ...
+    Signature Algorithm: ecdsa-with-SHA256
+    Issuer: CN=Example Intermediate CA
+    Validity:
+      Not Before: ...
+      Not After : ...
+    Subject: CN=api.example.com
+    Subject Public Key Info:
+      Public Key Algorithm: id-ecPublicKey
+      Public-Key: (256 bit)
+    X509v3 extensions:
+      Subject Alternative Name: DNS:api.example.com
+  Signature Algorithm: ecdsa-with-SHA256
+  Signature Value: ...
+```
+
+`Subject Public Key Info` is the server's public key. `Signature Value` is the Certificate Authority (CA)'s signature over the certificate. The matching server private key is absent.
+
+OpenSSL can render the structure without dumping the private key:
+
+```sh
+openssl x509 -in server-cert.pem -text -noout
+openssl pkey -pubin -in server-public.pem -text -noout
+```
+
+Avoid printing a production private key with diagnostic commands or copying it into logs.
+
+## How a public key becomes a certificate
+
+1. The server, user, or workload generates a key pair and keeps the private key.
+2. It creates a **Certificate Signing Request (CSR)** containing the public key and requested identity, then signs the request with the private key.
+3. An enrollment service verifies that the requester may use that identity—for example, by checking domain control, employee identity, device state, or workload attestation.
+4. A CA signs a new certificate containing the approved identity and public key. The CA does not need the subject's private key.
+
+The CSR signature proves that the requester controlled the private key during enrollment. Later connections still need a fresh proof of possession; an old CSR is not a reusable login credential.
+
+## Authentication needs both trust and possession
+
+A certificate can be copied freely, so merely sending one proves nothing about the sender. Certificate authentication answers two separate questions:
+
+1. **Should I trust this public key for this identity?** The verifier checks the certificate's name, lifetime, allowed usage, constraints, and issuer signatures, following the chain through any intermediate CA to a root CA already in its trust store.
+2. **Does this peer control the matching private key now?** The peer signs fresh protocol data or a challenge. The verifier checks that signature using the public key inside the certificate. Fresh data prevents an old proof from simply being replayed.
+
+In TLS 1.3, for example, the server sends its certificate chain and signs the handshake transcript. The chain says which public key is acceptable; the handshake signature proves the live server has the corresponding private key. Neither check replaces the other.
+
+## PKI turns public keys into trusted identities
+
+Anyone can generate a key pair and place `CN=your-bank.example` in a self-created certificate. Cryptography can prove that the same key holder signed something, but it cannot decide whether that identity claim is legitimate.
+
+**Public Key Infrastructure (PKI)** is the people, policy, software, hardware, and processes that decide who may obtain a certificate, sign that certificate under a trusted authority, distribute trust anchors, and manage the result through renewal and revocation.
+
+### Who operates the PKI?
+
+The application server normally does not implement a CA. It generates or receives a key, proves its identity or control to an enrollment service, obtains a certificate, presents it, and renews it. The authority can be operated in several ways:
+
+| Model | Who operates the CA? | Who trusts it? | Typical use |
+| --- | --- | --- | --- |
+| Public Web PKI | Public CAs such as Let's Encrypt or commercial providers | Browsers and operating systems through their public root programs | Public websites and internet APIs |
+| Self-operated private PKI | The organization runs offline roots, issuing CAs, policies, and enrollment services | Only managed devices and services receiving the private trust bundle | Enterprise devices, administrators, and internal workloads |
+| Managed private PKI | A cloud or security vendor operates much of the CA platform while the organization controls policy and trust distribution | The organization's managed environment | Internal TLS or device identity without operating all CA infrastructure |
+| Direct key registration | The application stores a public key during authenticated enrollment instead of using a shared CA hierarchy | That application alone | Passkeys, some SSH deployments, and tightly scoped systems |
+
+A self-signed certificate is not automatically trusted. You must distribute it—or its signing root—as a trust anchor or pin it explicitly. At that point you have taken responsibility for bootstrap, rotation, compromise response, and removal. Running a separate ad hoc CA inside every application server usually creates more trust problems than it solves.
+
+<ServiceArchitectureDiagram diagram={pkiTrustArchitecture} />
+
+### The certificate chain in plain language
+
+A verifier usually does not trust every website or workload certificate directly. It starts from a **trust anchor**—normally a root CA already in a browser, operating system, application, or private trust store.
+
+A common chain is:
+
+1. The root CA signs an intermediate CA certificate.
+2. The intermediate CA validates an enrollment request and signs a leaf certificate for a website, user, device, or workload.
+3. The holder presents the leaf certificate and relevant intermediate certificates.
+4. The verifier builds a path to a trusted root and validates signatures, identity, validity time, key usage, constraints, and any required revocation policy.
+5. The holder proves possession of the leaf certificate's private key. A copied certificate without that key is not enough.
+
+Keeping the root CA tightly protected and using intermediates for routine issuance limits how often the most powerful key is exposed. In private PKI, a Registration Authority (RA) may separately check identity and approve enrollment while the CA performs signing.
+
+You can inspect the public certificate presented by this site with OpenSSL:
+
+```sh
+openssl s_client \
+  -connect yifanzhai.com:443 \
+  -servername yifanzhai.com </dev/null 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+```
+
+This shows the leaf certificate's subject, issuer, lifetime, and names. The TLS handshake also makes the server prove it controls the corresponding private key.
+
+## Ordinary TLS and mutual TLS authenticate different peers
+
+In normal web TLS, the server presents a certificate and the browser validates it. The connection authenticates the server to the browser; it does not normally authenticate the human or browser to the server.
+
+In **mutual TLS (mTLS)**, both sides present certificates and prove possession of their private keys. mTLS is useful when both peers are managed, such as:
+
+- service-to-service traffic inside a platform;
+- managed employee devices connecting to sensitive infrastructure;
+- business-to-business integrations with a small set of known clients; or
+- administrators using smart cards in a high-assurance environment.
+
+mTLS is less attractive for a general consumer website. Issuing, installing, rotating, recovering, and revoking a client certificate on every personal device creates substantial support cost. TLS termination also matters: if a load balancer verifies the client certificate and forwards an identity header, downstream services must trust only that proxy, strip spoofed copies of the header, and protect the next hop.
+
+A certificate proves an identity binding and private-key possession under a policy. It does not automatically grant access. The application still decides whether that person or workload may read the requested record or call the requested operation.
+
+<Callout type="info" title="Public-key authentication does not always require PKI">
+WebAuthn also uses public-key cryptography, but the relying party normally stores each account's credential public key directly during registration. Everyday passkey verification does not need a global CA chain like website TLS. Authenticator attestation can introduce certificate-based trust when an organization needs to evaluate authenticator provenance, but many consumer deployments do not require it.
+</Callout>
+
+## PKI security is mostly lifecycle engineering
+
+The cryptographic signature is rarely the hardest operational problem. A sound deployment must:
+
+- authenticate and authorize enrollment before issuing a certificate;
+- protect CA and leaf private keys, using an HSM, TPM, secure enclave, or cloud KMS where appropriate;
+- constrain certificate names, validity, key usage, and which CA may issue what;
+- inventory certificates and monitor expiration;
+- rotate keys and trust bundles without downtime;
+- respond to compromise through Certificate Revocation Lists (CRLs), the Online Certificate Status Protocol (OCSP), short certificate lifetimes, or a combination; and
+- audit issuance, renewal, revocation, and policy changes.
+
+A CA cannot reach into every system and erase an already issued certificate. Relying parties must learn that it is revoked, or the certificate must expire. CRLs and OCSP provide status information but add availability, caching, privacy, and fail-open-versus-fail-closed decisions.
+
+Short-lived certificates reduce the maximum lifetime of a stolen key, but only if renewal is automated and revalidates the holder's current eligibility. The Automatic Certificate Management Environment (ACME), standardized in [RFC 8555](https://www.rfc-editor.org/rfc/rfc8555), automates public web certificate issuance and renewal. For internal services, managed private CAs or workload-identity systems such as [SPIFFE](https://spiffe.io/docs/latest/spiffe-about/spiffe-concepts/) can deliver short-lived identities and rotate trust bundles without baking long-lived keys into container images.
+
+## The short answer
+
+A key pair provides a cryptographic capability. A certificate binds the public key to an identity. A verifier validates the chain and policy, then requires fresh proof that the peer controls the private key. PKI makes those identity bindings manageable across organizations and large fleets—but only when enrollment, key protection, renewal, revocation, and trust-store changes are engineered as one lifecycle.
+
+The companion [Authentication Security Interview Question Bank](https://yifanzhai.com/writing/authentication-security-interview-question-bank/) collects the highest-value architecture questions and trade-offs across certificates, MFA, sessions, OAuth, and federation.
+
+## References and further reading
+
+- Internet Engineering Task Force, [RFC 5280: Internet X.509 Public Key Infrastructure Certificate and CRL Profile](https://www.rfc-editor.org/rfc/rfc5280).
+- Internet Engineering Task Force, [RFC 8446: The Transport Layer Security Protocol Version 1.3](https://www.rfc-editor.org/rfc/rfc8446.html).
+- Internet Engineering Task Force, [RFC 8555: Automatic Certificate Management Environment](https://www.rfc-editor.org/rfc/rfc8555).
+- SPIFFE, [SPIFFE concepts and workload identity](https://spiffe.io/docs/latest/spiffe-about/spiffe-concepts/).
+- Amazon Web Services, [AWS Private CA best practices](https://docs.aws.amazon.com/privateca/latest/userguide/ca-best-practices.html).

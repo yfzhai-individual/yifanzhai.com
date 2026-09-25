@@ -1,0 +1,188 @@
+---
+title: "Authentication Security Interview Question Bank"
+description: "A curated set of high-frequency authentication interview questions about sessions, tokens, OAuth, MFA, SSO, PKI, lifecycle security, and real-world architecture trade-offs."
+publishedAt: 2026-09-24
+tags: [security, authentication, interviews, system design]
+draft: false
+---
+
+import Callout from '../../components/Callout.astro';
+
+This is deliberately not a glossary disguised as an interview guide. A strong interviewer rarely cares whether you can recite thirty definitions. They want to see whether you separate trust boundaries, choose controls for a threat model, and notice what happens after the happy-path login.
+
+Use the companion guides for the underlying narrative:
+
+- [How Modern Web Authentication Fits Together](https://yifanzhai.com/writing/access-tokens-refresh-tokens-and-sessions/) covers passwords, passkeys, sessions, JSON Web Tokens (JWTs), OAuth, OpenID Connect (OIDC), browser and mobile storage, and Single Sign-On (SSO).
+- [MFA Is More Than a Second Prompt](https://yifanzhai.com/writing/mfa-is-more-than-a-second-prompt/) covers factor choice, phishing resistance, enrollment, recovery, and step-up authentication.
+- [From Public Keys to PKI](https://yifanzhai.com/writing/public-keys-certificates-and-pki/) covers key pairs, certificates, trust chains, mutual TLS (mTLS), and certificate lifecycle.
+
+This question bank keeps only the questions that repeatedly expose meaningful engineering judgment.
+
+## A framework for answering authentication questions
+
+Before naming a protocol or token format, establish five things:
+
+1. **Purpose:** Is the system proving a human identity, continuing a session, delegating API access, or authenticating a workload?
+2. **Trust boundaries:** Which component issues the credential, which component holds it, and which component accepts it?
+3. **Lifecycle:** How is the credential enrolled or issued, stored, rotated, recovered, revoked, and retired?
+4. **Threats:** Are you defending against password reuse, phishing, Cross-Site Scripting (XSS), Cross-Site Request Forgery (CSRF), session theft, device loss, malicious applications, or workload-secret leakage?
+5. **Failure modes:** What happens when the Identity Provider (IdP), session store, token service, certificate authority, risk engine, or recovery team is unavailable or compromised?
+
+<Callout type="info" title="A useful answer shape">
+State the default you would choose, explain which threat and trust boundary it addresses, name the cost it introduces, and describe the lifecycle and failure behavior. “It depends” becomes a strong answer only after you say what it depends on.
+</Callout>
+
+## The trade-offs behind most questions
+
+| Decision | One side optimizes for | The other side optimizes for | What you must discuss |
+| --- | --- | --- | --- |
+| Server-side session vs self-contained JWT | Central control and fresh state | Local verification and portability | Store availability, key distribution, stale claims, and revocation |
+| Backend-for-Frontend (BFF) vs browser-held OAuth tokens | Keeping tokens away from browser JavaScript | Direct API access and a simpler backend | XSS exposure, CSRF defenses, deployment boundaries, and client capability |
+| Short lifetime vs long lifetime | Smaller theft window and faster stale-state convergence | Fewer prompts and less renewal dependency | Refresh, rotation, availability, clocks, and recovery |
+| Device-bound vs synchronized credentials | Stronger hardware binding | Multi-device usability and recovery | Device loss, backup policy, enrollment, and account recovery |
+| Phishing-resistant MFA vs broad compatibility | Origin-bound cryptographic proof | Support for older devices and more users | Adoption, fallback, help desk, and downgrade paths |
+| Central SSO vs application independence | Consistent policy and fast offboarding | Smaller IdP blast radius and outage isolation | Federation validation, local sessions, emergency access, and IdP compromise |
+| Local token or certificate verification vs live lookup | Availability and low request latency | Immediate revocation and current state | Caching, introspection, denial lists, expiry, and fail-open behavior |
+| Public or managed PKI vs self-operated PKI | Lower operational burden and established automation | Direct control over policy and trust roots | Enrollment, key protection, trust distribution, rotation, audit, and incident response |
+
+There is no strongest architecture independent of context. The useful question is which failure or attack each choice makes easier—and whether the organization can operate the full lifecycle.
+
+## Browser sessions and tokens
+
+### 1. How would you authenticate a browser to its own backend?
+
+Start with a server-managed application session. After authentication, create a high-entropy session identifier, store the authoritative session state server-side, and send the identifier in a `Secure`, `HttpOnly`, appropriately scoped cookie with a deliberate `SameSite` policy. Rotate the identifier at login and privilege changes, expire it, protect state-changing requests against CSRF, and revoke the server-side record at logout.
+
+If the backend must call OAuth-protected APIs, a BFF can keep access and refresh tokens server-side while the browser retains only the application-session cookie. Expose OAuth tokens to browser JavaScript only when direct API access is an actual architectural requirement.
+
+### 2. Session or JWT—which should you choose?
+
+The question mixes a state model with a format. A session is the ongoing security context; a JWT is a signed claims format. A session can even be represented by a JWT.
+
+Use a server-side session when central revocation, current authorization state, and one browser-to-backend boundary matter most. Use a JWT when multiple recipients need portable claims and independent local validation enough to accept key distribution, stale claims, larger requests, and harder revocation. Server sessions can scale through distributed stores; “JWT is stateless, therefore it scales better” is not a complete answer.
+
+### 3. Cookie or `localStorage`—and does `HttpOnly` solve XSS?
+
+An `HttpOnly` cookie prevents JavaScript from reading the credential, but the browser sends it automatically, so state-changing endpoints need CSRF defenses. `localStorage` is not automatically attached to requests, but every same-origin script can read and export its persistent contents.
+
+For sensitive applications, prefer a BFF and a hardened session cookie. If a browser-only application must hold an access token, minimize its scope and lifetime and prefer memory over persistent Web Storage. `HttpOnly` reduces credential exfiltration; it does not stop injected JavaScript from issuing authenticated requests from the victim's browser.
+
+### 4. How do you revoke a self-contained credential immediately?
+
+You cannot obtain immediate revocation from offline signature validation and expiration alone. Add state through token introspection, a denial list, a session or grant version, a gateway check, or a very short lifetime with controlled renewal. Each restores some dependency on current server state.
+
+During logout, distinguish clearing the browser credential from invalidating the server session, revoking the refresh grant, and denying already-issued access tokens. State explicitly how much post-logout validity the design accepts.
+
+## OAuth, OIDC, and mobile clients
+
+### 5. What is the difference between an access token, refresh token, and ID token?
+
+- An **access token** is presented to a resource server and carries authority to call an API for a bounded audience, scope, subject, client, and lifetime.
+- A **refresh token** is presented only to the authorization server to obtain new tokens. It is usually longer-lived and must receive stronger storage, rotation, and revocation protection.
+- An **ID token** is an OIDC authentication statement intended for the client. It helps the client validate a login; it is not API authority.
+
+The format may be opaque or JWT-based depending on the issuer. Purpose and recipient—not the visual shape of the string—determine how a credential must be validated.
+
+### 6. Is “Sign in with Google” OAuth or OIDC?
+
+The login use case is OIDC, an identity layer built on OAuth. The client validates an ID token or OIDC response, maps the stable `(issuer, subject)` identity to a local account, and creates its own application session.
+
+“Connect Google Drive” is OAuth authorization. The resulting access token is intended for the Google Drive API and represents delegated permission. Both flows may use an authorization code, but their purpose, outputs, and recipients differ.
+
+### 7. Why use short-lived access tokens and rotating refresh tokens?
+
+The API sees a narrow credential with a small replay window. The more powerful renewal credential remains at the authorization-server boundary, where the client can protect it and the server can rotate, expire, and revoke it.
+
+With refresh-token rotation, every successful use invalidates the old token and returns a replacement. If an older member of the token family is used again, the server infers that two parties may possess the grant, revokes the active family, and requires fresh authorization. Rotation detects some replay; it does not make insecure storage safe.
+
+### 8. How should an installed mobile app perform OAuth login?
+
+Treat the installed app as a public client because a static secret shipped in the application package can be extracted. Open the authorization request in the system browser or a browser-controlled authentication session, use Authorization Code with Proof Key for Code Exchange (PKCE), validate `state` and OIDC `nonce` where applicable, and return through a verified redirect path.
+
+PKCE protects the authorization-code exchange; it does not protect an access token after issuance. Persist a refresh token only when continued access is necessary, and use application-isolated operating-system protection such as Apple Keychain or Android Keystore-backed encryption. Do not place an external IdP login inside an app-controlled WebView.
+
+## Passwords, passkeys, and MFA
+
+### 9. How should a server store passwords, salts, and peppers?
+
+Store a verifier produced by a password-specific, deliberately expensive Key Derivation Function (KDF), normally Argon2id, scrypt, bcrypt, or PBKDF2 under the applicable platform guidance. Generate a unique random salt for every password and store it in the same database record as the hash; the salt is not secret and prevents one precomputed table from attacking every account.
+
+A **pepper** is an optional shared secret mixed into password verification and kept outside the password database, such as in a secret manager or HSM. It can reduce the value of a database-only leak, but it introduces rotation and availability concerns and does not replace salts, a strong KDF, rate limiting, breached-password checks, or MFA.
+
+### 10. Does MFA stop phishing, and what makes a factor phishing-resistant?
+
+MFA is not one security property. SMS, Time-based One-Time Passwords (TOTPs), and ordinary push approval reduce password-only attacks but can still be relayed by a phishing proxy. Number matching reduces blind push approval but still relies on user attention.
+
+A phishing-resistant protocol binds the response to the legitimate verifier so a fake origin cannot reuse it. WebAuthn passkeys and correctly deployed FIDO2 security keys provide this origin binding. MFA still does not prevent malware or a phishing proxy from operating a session stolen after authentication.
+
+### 11. What is the hardest part of MFA after choosing the factor?
+
+Enrollment and recovery. Require strong evidence before binding or replacing an authenticator, notify the user, revoke old authenticators and relevant sessions, and ensure help-desk or fallback flows are not weaker than the threat MFA was meant to address.
+
+Design step-up authentication for sensitive actions, rate-limit prompts, enroll more than one recovery-capable authenticator for high-value accounts, and test lost-device and employee-termination flows. A strong front door with weak recovery is a weak system.
+
+### 12. Do passkeys remove passwords, MFA prompts, and sessions?
+
+They can remove the shared password and can satisfy multiple factors in one ceremony when a device-held private key is unlocked through local user verification. They do not remove the need for a web session after authentication.
+
+The private key may be device-bound, held on a security key, or protected by a synchronized credential provider. The relying party stores a public key and verifies a signed challenge; it does not receive the private key or the biometric used locally. Recovery and synchronization policy remain part of the design.
+
+## Federation and PKI
+
+### 13. In SSO, do all applications share one session?
+
+No. The IdP keeps an IdP-domain session. Each application redirects to the IdP, validates a federation response intended for itself, maps the external identity, and creates its own local session. SSO is the reduced-prompt experience; OIDC and SAML are federation protocols that can produce it.
+
+Therefore local logout, IdP logout, and global logout are different operations. Federation also does not automatically provision or deprovision accounts and entitlements; that lifecycle may use a protocol such as System for Cross-domain Identity Management (SCIM).
+
+### 14. What is the relationship between a private key, public key, certificate, and PKI?
+
+A private key performs a protected cryptographic operation; the corresponding public key verifies it. A certificate is a signed statement binding that public key to an identity, lifetime, and permitted usage. PKI is the larger system that validates enrollment, operates certificate authorities, distributes trust anchors, and handles issuance, rotation, revocation, and audit.
+
+Certificate authentication then performs two checks: validate the certificate chain and policy to decide whether the public key is trusted for the claimed identity, and verify a fresh signature to prove the peer currently controls the private key. A copied certificate alone is not authentication.
+
+### 15. When would you choose mTLS instead of an OAuth access token?
+
+mTLS authenticates managed peers at the connection layer and proves possession of certificate private keys. It is strong for internal service-to-service traffic, managed devices, and bounded business integrations where certificate issuance and rotation can be automated.
+
+An OAuth access token expresses scoped delegated authority at the application layer and can travel through application intermediaries. The two are not substitutes in every design: mTLS may authenticate the client or sender-constrain the token, while the access token states what delegated operation is allowed.
+
+For certificates, short lifetimes put a hard upper bound on use of a stolen key when revocation status is unavailable or inconsistently enforced. The trade-off is dependence on reliable automated renewal, clock discipline, and trust-bundle rotation.
+
+## Practical defaults by scenario
+
+| Scenario | A defensible starting point |
+| --- | --- |
+| Consumer web application | Offer passkeys; otherwise use a protected password plus MFA appropriate to the risk. Keep a secure application session and design recovery before forcing enrollment. |
+| Sensitive browser application using OAuth APIs | Use a BFF, an `HttpOnly` application-session cookie, and server-side access and refresh token storage. |
+| Browser-only Single-Page Application (SPA) | Use Authorization Code with PKCE, keep access tokens short-lived and preferably in memory, and issue refresh tokens only under the browser security profile and a justified threat model. |
+| Enterprise workforce SSO | Centralize policy at the IdP, prefer phishing-resistant authenticators, preserve separate application sessions, and keep tested emergency-access procedures. |
+| Administrator or high-value account | Require hardware-backed phishing-resistant authentication, enroll at least two independent authenticators, shorten sessions, and step up for destructive actions. |
+| Native mobile application | Use the system browser, Authorization Code with PKCE, a verified callback, and OS-protected storage for any necessary refresh token. |
+| Service-to-service inside a managed platform | Use workload identity with automatically rotated short-lived certificates and mTLS when the platform can operate issuance and trust distribution. |
+| Third-party API delegation | Use OAuth access tokens for delegated authority; add strong client authentication or sender constraint where the risk justifies it. |
+
+The recurring pattern is to use the strongest control that the entire lifecycle can support. A theoretically excellent primitive paired with manual renewal, weak recovery, unclear revocation, or an untested IdP outage plan is not an excellent authentication system.
+
+## Common weak answers to avoid
+
+- “JWT is stateless, so it is always more scalable.”
+- “`HttpOnly` prevents XSS.”
+- “MFA prevents phishing.”
+- “PKCE protects the access token.”
+- “SSO means all applications share a cookie.”
+- “A valid certificate automatically authorizes the request.”
+- “We will revoke it” without naming the state, propagation path, and accepted delay.
+
+A senior answer separates authentication, session continuity, delegation, and authorization—and then explains how compromise, recovery, revocation, and dependency failure change the design.
+
+## Primary references
+
+- NIST, [SP 800-63B-4: Authentication and Authenticator Management](https://pages.nist.gov/800-63-4/sp800-63b.html).
+- OWASP, [Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html), [Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html), and [OAuth 2.0 Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/OAuth2_Cheat_Sheet.html).
+- IETF, [RFC 9700: Best Current Practice for OAuth 2.0 Security](https://www.rfc-editor.org/rfc/rfc9700.html).
+- IETF, [RFC 10017: OAuth 2.0 for Browser-Based Applications](https://www.rfc-editor.org/rfc/rfc10017.html).
+- IETF, [RFC 8252: OAuth 2.0 for Native Apps](https://www.rfc-editor.org/rfc/rfc8252.html).
+- OpenID Foundation, [OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html).
+- W3C, [Web Authentication Level 3](https://www.w3.org/TR/webauthn-3/).
+- IETF, [RFC 5280: Internet X.509 Public Key Infrastructure Certificate and CRL Profile](https://www.rfc-editor.org/rfc/rfc5280).
