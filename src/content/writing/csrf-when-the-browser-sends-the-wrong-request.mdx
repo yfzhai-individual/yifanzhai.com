@@ -1,0 +1,196 @@
+---
+title: "CSRF: When the Browser Sends the Wrong Request"
+description: "A practical explanation of Cross-Site Request Forgery, how CSRF tokens stop it, and how to protect Spring applications with layered browser controls."
+publishedAt: 2026-09-25
+tags: [security, web-security, CSRF, Java]
+draft: false
+---
+
+import Callout from '../../components/Callout.astro';
+
+Imagine you are signed in to `bank.example`. Your browser holds this cookie:
+
+```http
+Set-Cookie: SESSION=abc123; Secure; HttpOnly; SameSite=None
+```
+
+The cookie is secure from JavaScript because it is `HttpOnly`, but the browser still attaches it automatically when a request qualifies for that cookie. That convenience creates the opening for **Cross-Site Request Forgery (CSRF)**:
+
+> CSRF makes a victim's browser send an attacker-chosen request to a site where the victim is already authenticated.
+
+The attacker usually cannot read the response. They may not need to. If the request changes an email address, creates an API key, or transfers money, causing the action is enough.
+
+## A normal request and a forged request look almost identical
+
+A legitimate settings page might submit:
+
+```http
+POST /account/email HTTP/1.1
+Host: bank.example
+Cookie: SESSION=abc123
+Content-Type: application/x-www-form-urlencoded
+
+email=alice%40example.com
+```
+
+Now suppose an attacker publishes this page on `attacker.example`:
+
+```html
+<form id="change-email"
+      action="https://bank.example/account/email"
+      method="post">
+  <input type="hidden" name="email" value="attacker@example.invalid">
+</form>
+<script>
+  document.querySelector('#change-email').submit();
+</script>
+```
+
+When a signed-in victim visits it, the browser can submit the form to `bank.example`. If cookie policy permits it, the browser adds `SESSION=abc123`. The malicious page never learns the cookie; it borrows the browser's authority.
+
+From the server's perspective, both requests contain a valid session and the same form fields. Authentication alone cannot distinguish them.
+
+<Callout type="info" title="CSRF is about ambient authority">
+The important question is not “does this endpoint use cookies?” It is “will the browser attach any credential without the calling page explicitly supplying it?” Session cookies are the common case, but HTTP Basic authentication, client certificates, and some other browser-managed credentials can create the same condition.
+</Callout>
+
+## How a CSRF token changes the test
+
+A CSRF token adds evidence that the request came through a page belonging to the application, not merely through the user's browser.
+
+For the common **synchronizer-token pattern**, the lifecycle is:
+
+1. After login, the server creates a cryptographically random value and associates it with the user's session.
+2. When the server renders a form, it puts that value in the page.
+3. The browser sends the value back in the form body or a request header.
+4. Before performing a state-changing action, the server compares the submitted value with the value expected for that session.
+5. A missing or invalid value causes the request to fail, normally with `403 Forbidden`.
+
+The rendered form might contain:
+
+```html
+<form action="/account/email" method="post">
+  <input name="email" type="email">
+  <input name="_csrf"
+         type="hidden"
+         value="f3ca0831-16e8-4f1f-9d81-78592b1021d7">
+  <button type="submit">Save</button>
+</form>
+```
+
+The resulting request now carries two independent pieces of evidence:
+
+```http
+POST /account/email HTTP/1.1
+Host: bank.example
+Cookie: SESSION=abc123
+Content-Type: application/x-www-form-urlencoded
+
+email=alice%40example.com&_csrf=f3ca0831-16e8-4f1f-9d81-78592b1021d7
+```
+
+The browser attaches the session cookie automatically. It does **not** automatically copy the CSRF token from `bank.example` into an attacker's form. The browser's **Same-Origin Policy (SOP)** normally prevents `attacker.example` from reading the bank's page to discover it.
+
+The token is not a replacement login credential. It is a random, session-bound request-correlation value. Do not put it in a URL, where browser history, analytics, proxies, and logs may record it.
+
+## The Spring Security version
+
+Spring Security enables CSRF protection by default for browser-oriented servlet applications. Its default repository stores the expected token in the HTTP session and checks unsafe methods such as `POST`, `PUT`, `PATCH`, and `DELETE`.
+
+An explicit configuration can document that decision:
+
+```java
+import static org.springframework.security.config.Customizer.withDefaults;
+
+@Bean
+SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+    http
+        .authorizeHttpRequests(auth -> auth
+            .requestMatchers("/login", "/assets/**").permitAll()
+            .anyRequest().authenticated())
+        .csrf(withDefaults());
+
+    return http.build();
+}
+```
+
+Spring's form tag library and Thymeleaf integration can add the hidden token automatically for unsafe form methods. Writing it explicitly makes the wire format easier to see:
+
+```html
+<form th:action="@{/account/email}" method="post">
+  <input name="email" type="email">
+  <input type="hidden"
+         th:name="${_csrf.parameterName}"
+         th:value="${_csrf.token}">
+  <button type="submit">Save</button>
+</form>
+```
+
+For a JavaScript request, copy the page's token into the header name exposed by the server:
+
+```html
+<meta name="_csrf" th:content="${_csrf.token}">
+<meta name="_csrf_header" th:content="${_csrf.headerName}">
+```
+
+```js
+const token = document.querySelector('meta[name="_csrf"]').content;
+const header = document.querySelector('meta[name="_csrf_header"]').content;
+
+await fetch('/account/email', {
+  method: 'POST',
+  credentials: 'same-origin',
+  headers: {
+    'Content-Type': 'application/json',
+    [header]: token
+  },
+  body: JSON.stringify({ email: 'alice@example.com' })
+});
+```
+
+An attacker can make a cross-site HTML form, but cannot choose an arbitrary header with that token without the target's Cross-Origin Resource Sharing (CORS) policy granting permission. The server validates the header before the controller changes data.
+
+For a **Single-Page Application (SPA)**, a framework may instead expose a token in a JavaScript-readable cookie such as `XSRF-TOKEN`, which the application copies into an `X-XSRF-TOKEN` header. This is safe only because another origin cannot read the cookie; merely sending the same token as another automatically attached cookie would not prove anything. Use the framework's supported integration rather than inventing an unsigned double-submit scheme.
+
+<Callout type="warning" title="Do not disable CSRF just to make a failing POST work">
+A `403` after enabling Spring Security often means the client omitted the token. Trace how the page or SPA obtains a fresh token and sends it. Disable CSRF only for endpoints whose authentication model does not rely on browser-attached credentials, and make that boundary explicit.
+</Callout>
+
+## The token is the primary control; the browser gives useful backup controls
+
+A mature application layers several controls:
+
+- **Use safe methods correctly.** `GET`, `HEAD`, and `OPTIONS` must not change server state. A link or image can cause a cross-site `GET` even when cross-site `POST` cookies are restricted.
+- **Set cookie attributes.** Use `Secure`, `HttpOnly`, and the strongest `SameSite` value compatible with the login and integration flows. `SameSite=Lax` or `Strict` blocks many cross-site cookie sends, but it is defense in depth rather than a reason to remove tokens.
+- **Validate the request origin.** Compare `Origin`, and when appropriate `Referer`, against an exact allowlist. Reject missing or unexpected values according to a carefully tested policy.
+- **Use Fetch Metadata.** `Sec-Fetch-Site` tells the server whether a browser request is `same-origin`, `same-site`, or `cross-site`. Sensitive endpoints can reject clearly cross-site requests while accounting for older or non-browser clients.
+- **Require recent authentication for dangerous actions.** Changing MFA, exporting secrets, or initiating a large payment deserves reauthentication and transaction confirmation, not only a CSRF token.
+- **Keep CORS narrow.** A permissive origin policy with credentials can give an attacker's JavaScript capabilities that normal cross-origin pages do not have.
+
+“Same-site” is not the same as “same-origin.” `app.example.com` and a compromised `blog.example.com` may be different origins but the same site for cookie policy. This is one reason a CSRF token and exact origin validation remain valuable.
+
+## When CSRF is not the main risk
+
+If an API accepts only an access token that client code must explicitly place in `Authorization: Bearer ...`, and no browser-managed credential authenticates the request, a foreign page cannot make the browser add that header automatically. Traditional CSRF is usually not the primary threat to that endpoint.
+
+That does not automatically make browser storage safer. JavaScript-readable bearer tokens create a different concern: Cross-Site Scripting (XSS) may read or use them. Choose the authentication architecture based on the full threat model, not by exchanging one acronym for another.
+
+Also remember that XSS on your own origin can usually read a CSRF token or perform the protected action directly. CSRF protection does not repair XSS.
+
+## The interview-ready explanation
+
+A strong short answer sounds like this:
+
+> CSRF abuses credentials the browser attaches automatically. An attacker causes the victim's browser to send a state-changing request, and the server mistakes the valid session for proof that the application initiated it. I prevent it with a framework-managed, unpredictable token bound to the session and submitted outside the cookie-only channel. I also keep state changes off GET, use `SameSite` cookies, validate origin or Fetch Metadata, restrict CORS, and require step-up authentication for high-risk operations. XSS can bypass CSRF defenses, so both must be addressed.
+
+When reviewing an endpoint, ask four concrete questions: What authenticates it? Does the browser attach that credential automatically? What proves the request came through our application? What happens when the proof is absent?
+
+The next article, [XSS: When Untrusted Data Becomes Browser Code](/writing/xss-when-data-becomes-browser-code/), follows the browser boundary from a stored comment to an executable DOM sink.
+
+## References and further reading
+
+- OWASP, [Cross-Site Request Forgery Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html).
+- Spring Security, [Cross-Site Request Forgery (CSRF)](https://docs.spring.io/spring-security/reference/servlet/exploits/csrf.html).
+- MDN, [Cross-site request forgery (CSRF)](https://developer.mozilla.org/en-US/docs/Web/Security/Attacks/CSRF).
+- MDN, [`Set-Cookie` and `SameSite`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie).
+- MDN, [`Sec-Fetch-Site`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Sec-Fetch-Site).

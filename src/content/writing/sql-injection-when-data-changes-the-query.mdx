@@ -1,0 +1,229 @@
+---
+title: "SQL Injection: When Data Changes the Query"
+description: "A practical Java guide to SQL injection, parameterized queries, dynamic sorting, ORM pitfalls, least privilege, and interview-ready review habits."
+publishedAt: 2026-09-25
+tags: [security, web-security, SQL-injection, Java]
+draft: false
+---
+
+import Callout from '../../components/Callout.astro';
+
+Most SQL injection bugs begin with ordinary application code: a search box, report filter, login form, or administrator export. The mistake is not that the input contains a quote. The mistake is allowing input to change the grammar of a query.
+
+> SQL injection happens when untrusted data is concatenated into SQL and the database interprets part of that data as a command.
+
+The durable fix is to preserve the boundary between **SQL structure** and **SQL values**.
+
+## A tenant search that leaks every customer
+
+Suppose a Java service searches for a user inside the signed-in operator's tenant:
+
+```java
+List<User> findUser(Connection connection,
+                    String tenantId,
+                    String email) throws SQLException {
+    String sql = "SELECT id, email, role FROM users " +
+            "WHERE tenant_id = '" + tenantId + "' " +
+            "AND email = '" + email + "'";
+
+    try (Statement statement = connection.createStatement();
+         ResultSet rows = statement.executeQuery(sql)) {
+        return mapUsers(rows);
+    }
+}
+```
+
+For normal input, the database receives:
+
+```sql
+SELECT id, email, role
+FROM users
+WHERE tenant_id = 'tenant-a'
+  AND email = 'alice@example.com'
+```
+
+An attacker supplies this as the email:
+
+```text
+nobody@example.com' OR '1'='1' --
+```
+
+After concatenation, the query becomes:
+
+```sql
+SELECT id, email, role
+FROM users
+WHERE tenant_id = 'tenant-a'
+  AND email = 'nobody@example.com' OR '1'='1' --'
+```
+
+`OR '1'='1'` is always true, and `--` comments out the leftover quote in SQL dialects that support this comment syntax. Depending on operator precedence and the database, the query can return users from every tenant.
+
+The visible input field is only one possible source. Query parameters, JSON, headers, cookies, imported files, message queues, database values written earlier, and administrator-only tools are all untrusted when they can influence an interpreter.
+
+<Callout type="warning" title="Authentication does not make input trusted">
+An authenticated customer can attack another tenant, and a compromised internal account can target administration queries. Parameterize at the database boundary regardless of where the value came from.
+</Callout>
+
+## Prepared statements keep values in the value role
+
+Java's `PreparedStatement` sends SQL with placeholders and binds each value separately:
+
+```java
+List<User> findUser(Connection connection,
+                    String tenantId,
+                    String email) throws SQLException {
+    String sql = """
+            SELECT id, email, role
+            FROM users
+            WHERE tenant_id = ?
+              AND email = ?
+            """;
+
+    try (PreparedStatement statement = connection.prepareStatement(sql)) {
+        statement.setString(1, tenantId);
+        statement.setString(2, email);
+
+        try (ResultSet rows = statement.executeQuery()) {
+            return mapUsers(rows);
+        }
+    }
+}
+```
+
+If the attacker submits the same payload, the database searches for an email whose literal value contains the quotes, spaces, and comment marker. It does not splice `OR` into the query plan.
+
+That is why parameterization is stronger than looking for suspicious characters. Apostrophes are valid data—consider `o'connor@example.com`—and attack syntax has many variations. The database driver already knows how to represent a value safely for its protocol and type.
+
+Use the matching setter where practical: `setLong`, `setBoolean`, `setTimestamp`, `setObject` for a UUID, and so on. Validate business constraints too, but do not rely on validation as the SQL boundary.
+
+## Placeholders cannot represent SQL structure
+
+A common follow-up appears in sortable tables:
+
+```java
+String sql = "SELECT id, total, created_at FROM orders " +
+        "ORDER BY " + request.getParameter("sort"); // vulnerable
+```
+
+This does not work:
+
+```sql
+ORDER BY ?
+```
+
+A bind parameter represents a **value**, not a column name, table name, keyword, or `ASC`/`DESC` token. Let the client choose a small business option and map it to SQL owned by the server:
+
+```java
+String orderBy = switch (sortOption) {
+    case "newest" -> "created_at DESC";
+    case "oldest" -> "created_at ASC";
+    case "highest-total" -> "total DESC";
+    default -> throw new IllegalArgumentException("Unsupported sort");
+};
+
+String sql = """
+        SELECT id, total, created_at
+        FROM orders
+        WHERE tenant_id = ?
+        ORDER BY %s
+        LIMIT ?
+        """.formatted(orderBy);
+
+try (PreparedStatement statement = connection.prepareStatement(sql)) {
+    statement.setString(1, tenantId);
+    statement.setInt(2, Math.min(requestedLimit, 100));
+    // Execute and map rows.
+}
+```
+
+Only strings selected by trusted code enter the SQL structure. The tenant and limit remain bound values. The same allowlist-mapping approach applies when dynamic table or column names are truly unavoidable; often the cleaner answer is to redesign the query.
+
+For a dynamic `IN` list, generate exactly one `?` placeholder per element and bind every element. Never join raw values with commas.
+
+## An ORM does not remove the boundary
+
+Object-Relational Mapping (ORM) libraries reduce handwritten SQL, but their query languages are still interpreters. This Hibernate Query Language (HQL) is vulnerable:
+
+```java
+String hql = "from Inventory where sku = '" + requestedSku + "'";
+List<Inventory> items = session.createQuery(hql, Inventory.class).list();
+```
+
+Use a named parameter:
+
+```java
+List<Inventory> items = session.createQuery(
+        "from Inventory where sku = :sku",
+        Inventory.class
+    )
+    .setParameter("sku", requestedSku)
+    .list();
+```
+
+Watch native queries, hand-built filters, dynamic `ORDER BY`, and convenience methods that accept a raw query fragment. A safe abstraction can be bypassed by one concatenated “advanced search” clause.
+
+Stored procedures have the same condition: they are safe when their parameters remain values. A procedure that concatenates an argument into dynamic SQL simply moves the vulnerability into the database.
+
+## Common “fixes” that do not fix the cause
+
+| Attempt | Why it fails |
+| --- | --- |
+| Remove `'`, `--`, or the text `OR` | Easy to bypass, corrupts legitimate data, and depends on database syntax |
+| Escape values manually | Encoding rules vary by database, mode, driver, and character set; use driver parameters |
+| Validate with a regular expression only | Useful for business rules, but a future code path may concatenate the “validated” value differently |
+| Use an ORM | Safe only while queries and native fragments use its parameter APIs |
+| Hide database errors | Reduces feedback to the attacker but leaves blind and time-based injection possible |
+| Put a Web Application Firewall (WAF) in front | Useful detection and containment, not a substitute for separating code and data |
+
+Escaping is a last-resort compatibility measure for a legacy interface that genuinely cannot parameterize. It should use a database-specific, maintained mechanism and have a migration plan.
+
+## Reduce the blast radius after parameterization
+
+Prepared statements prevent the primary bug. Production systems should also limit what a mistake can reach:
+
+- **Least-privilege database accounts:** The web application should not connect as a database administrator. A read-only reporting service should not have update or delete permission.
+- **Separate duties:** Migrations, background jobs, and runtime traffic often need different accounts. One universal credential makes every injection more powerful.
+- **Views and row controls:** Expose only required columns and rows where the database supports an enforceable policy. Application-level tenant filters alone are easy to omit.
+- **Safe errors:** Return a generic failure and correlation ID to the client. Record the detailed exception in protected logs without logging secrets or entire sensitive queries.
+- **Monitoring:** Alert on unusual query errors, unexpected result sizes, long-running requests, and denied database operations. Do not make alerting the only control.
+- **Resource limits:** Bound page size, query duration, and connection use to reduce expensive-query abuse.
+- **Testing and review:** Static analysis can find untrusted strings reaching query execution. Integration tests should exercise repository methods with quotes and other boundary cases.
+
+An injection can also be **second-order**: an unsafe value is stored harmlessly, then a later batch job concatenates it into SQL. Parameterize every execution point, not only values directly read from today's HTTP request.
+
+## Keep authorization separate
+
+This query is safely parameterized but may still be insecure:
+
+```java
+PreparedStatement statement = connection.prepareStatement(
+        "SELECT id, total FROM orders WHERE id = ?"
+);
+statement.setObject(1, requestedOrderId);
+```
+
+Parameterization prevents SQL injection. It does not prove that the signed-in user may view that order. The query or service must also enforce tenant and ownership policy.
+
+This distinction matters in interviews: **injection safety protects the interpreter; authorization protects the object**.
+
+<Callout type="info" title="The same pattern appears beyond SQL">
+LDAP, shell commands, template expressions, XPath, and NoSQL query documents can all become injection sinks. Prefer structured APIs that keep attacker-controlled values separate from the command language, then apply context-specific validation and least privilege.
+</Callout>
+
+## The interview-ready explanation
+
+A strong answer can be short and concrete:
+
+> SQL injection occurs when untrusted input changes SQL structure. I prevent it with parameterized queries or a query builder that binds values, never string concatenation. Bind parameters cannot represent identifiers or sort keywords, so I map those client choices through a server-owned allowlist. I also review ORM and stored-procedure escape hatches, use least-privilege database accounts, return safe errors, monitor anomalies, and enforce authorization separately.
+
+In code review, look for strings assembled near `Statement`, `createNativeQuery`, raw repository annotations, stored procedure dynamic SQL, and query-builder “literal” or “raw” methods. For every variable, ask whether the database receives it as a bound value or reparses it as SQL.
+
+For the browser-side and network-side companions, see [CSRF: When the Browser Sends the Wrong Request](/writing/csrf-when-the-browser-sends-the-wrong-request/), [XSS: When Untrusted Data Becomes Browser Code](/writing/xss-when-data-becomes-browser-code/), and [SSRF: When Your Server Becomes the Attacker's HTTP Client](/writing/ssrf-when-your-server-becomes-the-http-client/).
+
+## References and further reading
+
+- OWASP, [SQL Injection Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html).
+- OWASP, [Injection Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Injection_Prevention_Cheat_Sheet.html).
+- Oracle, [Using Prepared Statements](https://docs.oracle.com/javase/tutorial/jdbc/basics/prepared.html).
+- OWASP, [Input Validation Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Input_Validation_Cheat_Sheet.html).

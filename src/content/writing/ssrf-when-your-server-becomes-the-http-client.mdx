@@ -1,0 +1,243 @@
+---
+title: "SSRF: When Your Server Becomes the Attacker's HTTP Client"
+description: "A practical guide to Server-Side Request Forgery in URL imports, webhooks, and previews, with layered Java, network, redirect, and cloud defenses."
+publishedAt: 2026-09-25
+tags: [security, web-security, SSRF, Java]
+draft: false
+---
+
+import Callout from '../../components/Callout.astro';
+
+Many useful product features ask a backend to fetch a URL:
+
+- “Import my profile image.”
+- “Preview this link.”
+- “Test my webhook.”
+- “Convert this web page to PDF.”
+- “Fetch an Open Graph image.”
+
+The browser cannot always make that request because of credentials, Cross-Origin Resource Sharing (CORS), or network reachability, so the server does it. The feature becomes vulnerable to **Server-Side Request Forgery (SSRF)** when an attacker controls where that privileged server request goes.
+
+> SSRF turns your server into an attacker-controlled HTTP client.
+
+The important word is **server-side**. A URL unreachable from the public internet may be perfectly reachable from the application: `localhost`, a database admin panel, a Kubernetes service, or a cloud metadata endpoint.
+
+## A normal-looking image importer
+
+This Java code accepts a URL and downloads its response:
+
+```java
+record ImportImageRequest(String url) {}
+
+private final HttpClient httpClient = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(3))
+        .build();
+
+byte[] importImage(ImportImageRequest input) throws Exception {
+    URI target = URI.create(input.url());
+    HttpRequest request = HttpRequest.newBuilder(target)
+            .timeout(Duration.ofSeconds(5))
+            .GET()
+            .build();
+
+    return httpClient.send(
+            request,
+            HttpResponse.BodyHandlers.ofByteArray()
+    ).body();
+}
+```
+
+It works for `https://images.example/photo.jpg`. It also lets the caller try destinations such as:
+
+```text
+http://127.0.0.1:8080/admin
+http://10.0.4.12:9090/actuator/env
+http://169.254.169.254/latest/meta-data/
+http://internal-service.namespace.svc.cluster.local/
+```
+
+The application server may have firewall access, service identity, local trust, or cloud permissions that the attacker does not. If the importer returns the response, it becomes a read tunnel into that environment. Even if it hides the body, timing and status differences can scan ports, and a request with side effects can become a write primitive.
+
+SSRF frequently appears in features that do not look security-sensitive. That is why code review should search for outbound clients and URL parsers, not only controllers named `proxy`.
+
+## The exploit crosses two trust boundaries
+
+For the image-import example, trace the request:
+
+```text
+Attacker input
+    |
+    | url=http://internal-admin/delete?id=42
+    v
+Public application server
+    |
+    | outbound request using the server's network position
+    v
+Internal service or cloud metadata endpoint
+```
+
+The internal service may trust source network location and omit normal authentication. The public server accidentally lends that trust to an attacker-supplied destination.
+
+SSRF can therefore lead to:
+
+- disclosure of internal pages, configuration, or cloud credentials;
+- internal port and service discovery;
+- actions against admin endpoints that trust the local network;
+- access to protocols or files supported by an overly capable URL library;
+- denial of service through slow, huge, or never-ending responses.
+
+<Callout type="warning" title="Blocking the literal string localhost is not a defense">
+The same address may be written as an IPv4 or IPv6 literal, represented in unusual numeric forms, returned by DNS, or reached after an HTTP redirect. URL parsing, DNS resolution, and connection behavior all matter.
+</Callout>
+
+## The safest design does not accept an arbitrary destination
+
+If the product integrates with three known image providers, the client should send a provider identifier and an asset identifier—not an unrestricted URL.
+
+```java
+private static final Map<String, URI> IMAGE_PROVIDERS = Map.of(
+        "vendor-a", URI.create("https://images.vendor-a.example/public/"),
+        "vendor-b", URI.create("https://cdn.vendor-b.example/assets/")
+);
+
+URI imageUri(String providerId, String assetId) {
+    URI base = IMAGE_PROVIDERS.get(providerId);
+    if (base == null) {
+        throw new IllegalArgumentException("Unknown provider");
+    }
+    if (!assetId.matches("[A-Za-z0-9._-]{1,100}") ||
+            assetId.equals(".") || assetId.equals("..")) {
+        throw new IllegalArgumentException("Invalid asset id");
+    }
+
+    URI target = base.resolve(assetId);
+    if (!base.getHost().equals(target.getHost())) {
+        throw new IllegalArgumentException("Destination changed");
+    }
+    return target;
+}
+```
+
+The server owns the scheme, host, port, and base path. The user chooses only a value with a narrow business meaning. This is easier to reason about than proving that every possible URL is harmless.
+
+The same pattern works for webhooks: create an administrator-approved destination record, then let runtime requests refer to its opaque ID. Revalidate the destination when it is created and whenever it changes.
+
+## When arbitrary URLs are a real requirement
+
+A link-preview service may genuinely need to fetch public websites. It needs several independent controls.
+
+The following Java sketch shows useful application checks, not a complete production URL firewall:
+
+```java
+URI validatePublicHttpsUrl(String rawUrl) throws Exception {
+    URI uri = URI.create(rawUrl).normalize();
+
+    if (!"https".equalsIgnoreCase(uri.getScheme()) ||
+            uri.getHost() == null ||
+            uri.getUserInfo() != null ||
+            uri.getFragment() != null) {
+        throw new IllegalArgumentException("Unsupported URL");
+    }
+
+    int port = uri.getPort();
+    if (port != -1 && port != 443) {
+        throw new IllegalArgumentException("Unsupported port");
+    }
+
+    for (InetAddress address : InetAddress.getAllByName(uri.getHost())) {
+        if (address.isAnyLocalAddress() ||
+                address.isLoopbackAddress() ||
+                address.isLinkLocalAddress() ||
+                address.isSiteLocalAddress() ||
+                address.isMulticastAddress()) {
+            throw new IllegalArgumentException("Non-public destination");
+        }
+    }
+
+    return uri;
+}
+```
+
+This establishes several good rules: parse once with a real URI parser, allow only the needed protocol and port, reject ambiguous user-info and fragments, resolve all addresses, and reject obviously local or non-routable results.
+
+It still has an important limitation: DNS may return a public address during validation and a private address when the HTTP client connects. This is often called **DNS rebinding** or a time-of-check/time-of-use gap. Production designs normally enforce the decision at connection time through a hardened egress proxy, controlled resolver, or client that connects to the already-vetted address while preserving the original hostname for TLS verification.
+
+IP classification also needs a complete, tested understanding of IPv4, IPv6, IPv4-mapped IPv6, organization-specific network ranges, and parser normalization. Treat the helper above as an explanatory layer, not a library to paste into production unchanged.
+
+## Redirects must pass the same policy
+
+Suppose validation approves:
+
+```text
+https://attacker.example/looks-public
+```
+
+That server can answer:
+
+```http
+HTTP/1.1 302 Found
+Location: http://127.0.0.1:8080/admin
+```
+
+If the HTTP client follows redirects automatically, validation protected only the first hop. Java's `HttpClient` defaults to `Redirect.NEVER`; keep it explicit for security-sensitive fetches:
+
+```java
+HttpClient client = HttpClient.newBuilder()
+        .followRedirects(HttpClient.Redirect.NEVER)
+        .connectTimeout(Duration.ofSeconds(3))
+        .build();
+```
+
+If the product must support redirects, handle a small maximum number manually and run the complete destination validation for every `Location` value. Resolve relative redirects against the previous URI, then validate the result before connecting.
+
+## Treat the response as untrusted too
+
+Preventing internal access is only half of a robust fetcher. The remote server controls its response.
+
+Apply limits such as:
+
+- short connection, read, and total-operation timeouts;
+- a small maximum redirect count;
+- a maximum response size enforced while streaming, not after an unbounded allocation;
+- an allowlist of media types and verification of the actual file format;
+- no forwarding of application cookies, authorization headers, or internal tracing headers;
+- no raw upstream error body returned to the caller;
+- concurrency and rate limits so the feature cannot become a scanning or denial-of-service service.
+
+`BodyHandlers.ofByteArray()` in the vulnerable example reads the entire body. A production importer should use a streaming body handler and stop after its configured byte limit.
+
+If downloaded HTML is later rendered, or an image-processing library parses the file, separate vulnerabilities may follow. SSRF validation does not sanitize HTML or make a complex file decoder safe.
+
+## Network and cloud controls contain application mistakes
+
+Application validation is necessary, but network policy should make the dangerous path impossible where practical:
+
+- Route outbound web fetching through an egress proxy that applies destination policy and records requests.
+- Deny application subnets access to internal management networks and unexpected ports.
+- Give workloads the minimum cloud and service permissions they need.
+- Disable cloud instance metadata when unused. On Amazon EC2, require token-based **Instance Metadata Service Version 2 (IMDSv2)** and configure an appropriate hop limit.
+- Require authentication on internal services; “only reachable from the private network” is not identity.
+- Alert on attempts to reach loopback, link-local, private, metadata, and unusual DNS destinations.
+
+These layers also help with a parser bug, a missed IPv6 range, or a new URL-fetching feature that bypasses the shared validator.
+
+<Callout type="info" title="Allowlist destinations; do not maintain an internet-sized denylist">
+A denylist is useful as a final safety net, but attackers have many equivalent names and addresses. Exact partner destinations or an egress policy describing the public networks and ports the feature may use is a more durable boundary.
+</Callout>
+
+## The interview-ready explanation
+
+A strong answer separates the bug from its impact:
+
+> SSRF occurs when an attacker influences a server-side network destination. The server can reach internal services, metadata, or trusted networks that the attacker cannot, so the attacker borrows the server's network position and identity. I first redesign the feature around server-owned destination IDs. If arbitrary public URLs are required, I restrict schemes and ports, normalize and resolve the destination, block non-public ranges, disable redirects or revalidate every hop, and enforce the same decision at connection time. I also add egress filtering, cloud metadata protection, least privilege, timeouts, response-size limits, and safe error handling.
+
+In review, ask: Who controls the scheme, host, port, path, DNS record, and redirects? Which network identity sends the request? Which headers or credentials follow it? What can that server reach that the original user cannot?
+
+The final article in this set, [SQL Injection: When Data Changes the Query](/writing/sql-injection-when-data-changes-the-query/), applies the same code-versus-data boundary to a database interpreter.
+
+## References and further reading
+
+- OWASP, [Server-Side Request Forgery Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html).
+- OWASP Top 10, [A10:2021 – Server-Side Request Forgery](https://top10.owasp.org/2021/A10_2021-Server-Side_Request_Forgery_%28SSRF%29/).
+- Oracle, [`HttpClient.Redirect`](https://docs.oracle.com/en/java/javase/25/docs/api/java.net.http/java/net/http/HttpClient.Redirect.html).
+- Amazon Web Services, [Configure instance metadata options](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-options.html).

@@ -1,0 +1,189 @@
+---
+title: "XSS: When Untrusted Data Becomes Browser Code"
+description: "A developer-focused guide to stored, reflected, and DOM XSS, with practical Thymeleaf, JavaScript, sanitization, CSP, and cookie defenses."
+publishedAt: 2026-09-25
+tags: [security, web-security, XSS, Java]
+draft: false
+---
+
+import Callout from '../../components/Callout.astro';
+
+A support application stores this customer message in its database:
+
+```html
+<img src=x onerror="/* perform an authenticated action */">
+```
+
+The database has not been “hacked.” The dangerous moment comes later, when an agent opens the ticket and the application inserts that string into a page as HTML. The browser sees an element and an event handler, not text.
+
+That is the useful mental model for **Cross-Site Scripting (XSS)**:
+
+> XSS happens when untrusted data reaches a browser execution context without the protection required for that context.
+
+The browser runs the injected code with the vulnerable site's origin. It may read page data, call same-origin APIs, change what the user sees, capture input, or operate the user's authenticated session.
+
+## Follow the data to the browser sink
+
+Consider a Spring MVC support portal. The controller loads a comment exactly as it was stored:
+
+```java
+@GetMapping("/tickets/{id}")
+String ticket(@PathVariable long id, Model model) {
+    model.addAttribute("ticket", ticketRepository.findById(id).orElseThrow());
+    return "ticket";
+}
+```
+
+This template is vulnerable:
+
+```html
+<!-- th:utext means unescaped text -->
+<div class="comment" th:utext="${ticket.comment}"></div>
+```
+
+If the comment contains markup, Thymeleaf's `th:utext` deliberately emits it as markup. An attacker can submit a payload once, wait for a support agent or administrator to view it, and execute code in that more privileged session. This is **stored XSS**.
+
+The direct fix for a plain-text comment is to preserve the data as text:
+
+```html
+<!-- th:text HTML-encodes the value for this text context -->
+<div class="comment" th:text="${ticket.comment}"></div>
+```
+
+The browser now receives characters such as `&lt;` instead of an opening tag. The user still sees what they typed, but the parser does not reinterpret it as page structure.
+
+The same distinction appears in client-side code:
+
+```js
+// Vulnerable: parses the string as HTML.
+preview.innerHTML = commentFromApi;
+
+// Safe for a plain-text preview.
+preview.textContent = commentFromApi;
+```
+
+The bug is not “the database allowed angle brackets.” It is the unsafe transition from untrusted data to an executable sink.
+
+## Stored, reflected, and DOM XSS differ mainly in the path
+
+| Type | Typical day-to-day path | Example |
+| --- | --- | --- |
+| Stored XSS | Input is saved, then rendered later | A ticket comment executes when staff open it |
+| Reflected XSS | Input is copied into the immediate response | A search term is echoed into an error page without encoding |
+| DOM XSS | Browser JavaScript moves input into a dangerous DOM API | `location.hash` is assigned to `innerHTML` |
+
+A DOM example may never pass through Java:
+
+```js
+// URL: https://app.example/help#<img src=x onerror=...>
+const topic = decodeURIComponent(location.hash.slice(1));
+document.querySelector('#topic').innerHTML = topic; // vulnerable
+```
+
+Use `textContent` if the feature needs text. If it needs a fixed identifier, validate it against a small allowlist and map it to content already controlled by the application.
+
+These labels help describe where to look. The prevention question remains the same: which parser will consume this value, and how do we keep the value in the data role intended for it?
+
+## Encoding must match the output context
+
+“HTML-escape everything” is incomplete advice because one page contains several languages and parsers.
+
+| Destination | Safer default |
+| --- | --- |
+| Text between HTML tags | Use the template engine's escaped text binding, such as `th:text` |
+| HTML attribute value | Use an attribute API or framework binding, keep the value quoted, and avoid event attributes |
+| JavaScript | Keep data out of inline scripts; serialize it as JSON and read it as data |
+| URL | Construct it with a URL API and allowlist expected schemes and destinations |
+| CSS | Avoid placing untrusted values in CSS; use constrained server-owned choices |
+| DOM text | Assign to `textContent`, not `innerHTML` |
+
+Encoding for one context can be unsafe in another. A value safely encoded for HTML text is not automatically safe inside JavaScript, a URL, or a CSS expression. Prefer framework APIs that know the destination context instead of manually replacing a few characters.
+
+<Callout type="warning" title="Input validation is useful, but it is not the primary XSS control">
+Names such as `O'Connor` and mathematical text legitimately contain characters that crude filters reject. Attack syntax also has many equivalent forms. Validate business shape and length at input, then still encode at every output sink.
+</Callout>
+
+## If users may author HTML, sanitize it
+
+Some products intentionally accept rich text: documentation, formatted biographies, or ticket descriptions. Encoding the entire value would display the markup rather than formatting it. In that case, use a maintained HTML sanitizer with a deliberately small policy.
+
+The [OWASP Java HTML Sanitizer](https://owasp.org/projects/java-html-sanitizer) provides policy-based sanitization:
+
+```java
+import org.owasp.html.PolicyFactory;
+import org.owasp.html.Sanitizers;
+
+PolicyFactory COMMENT_HTML =
+        Sanitizers.FORMATTING.and(Sanitizers.LINKS);
+
+String safeHtml = COMMENT_HTML.sanitize(untrustedHtml);
+```
+
+Store the original only if the product needs it and access is tightly controlled. Render the sanitized result in the intended HTML location. Define whether links, images, styles, classes, and protocols are actually needed; a generic “allow HTML” switch is not a policy.
+
+Sanitization and encoding solve different requirements:
+
+- **Encoding** preserves every character as inert text.
+- **Sanitization** parses markup, removes constructs outside a policy, and returns a restricted HTML subset.
+
+Do not sanitize a value and later concatenate it into JavaScript, CSS, or an attribute. The sanitization policy was designed for an HTML context.
+
+## What an attacker can do even when cookies are HttpOnly
+
+`HttpOnly` prevents JavaScript from reading the cookie value through `document.cookie`. That is important, but it does not stop code already running on your origin from sending same-origin requests. The browser can still attach the cookie:
+
+```js
+const csrf = document.querySelector('meta[name="_csrf"]').content;
+
+await fetch('/api/account/email', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'X-CSRF-TOKEN': csrf
+  },
+  body: JSON.stringify({ email: 'attacker@example.invalid' })
+});
+```
+
+Here the payload reads the same CSRF token that legitimate page code can read, while the browser supplies the `HttpOnly` session cookie. It can also inspect responses available to the application, rewrite a payment destination in the UI, or present a convincing credential prompt. Cookie flags reduce impact; they do not turn XSS into a harmless alert box.
+
+## Add browser guardrails after fixing the sinks
+
+The primary control is still safe output handling. Then add layers that make a missed sink harder to exploit:
+
+- **Content Security Policy (CSP):** Restrict where scripts, objects, frames, and other resources may come from. A nonce- or hash-based strict policy is stronger than a long host allowlist. Start with `Content-Security-Policy-Report-Only`, observe legitimate violations, and then enforce.
+- **Trusted Types:** In supporting browsers, require sensitive DOM sinks such as `innerHTML` to receive a reviewed `TrustedHTML` object instead of an arbitrary string.
+- **Cookie flags:** Use `HttpOnly`, `Secure`, and an appropriate `SameSite` value to limit common post-exploitation paths.
+- **Separate risky content:** User-controlled documents or uploads that must remain active HTML belong on a separate origin without application cookies or privileged APIs.
+- **Test and review:** Search for unsafe template features and sinks such as `th:utext`, `innerHTML`, `outerHTML`, `document.write`, string-to-code functions, and unsafe React/Vue escape hatches.
+
+A baseline header may look like this, but production policy must match the actual application:
+
+```http
+Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-r4nd0m'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'
+```
+
+The nonce must be freshly generated for each response and added only to scripts the server trusts. Do not add `'unsafe-inline'` merely to make the console quiet.
+
+<Callout type="info" title="CSP is defense in depth, not an encoding engine">
+A permissive or bypassable policy cannot make `innerHTML` safe. Fix the data-to-sink transition first, then use CSP and Trusted Types to contain mistakes that remain.
+</Callout>
+
+## The interview-ready explanation
+
+A concise answer should cover both cause and control:
+
+> XSS occurs when untrusted data reaches a browser context where it is interpreted as code or markup. Stored, reflected, and DOM XSS describe different data paths, but I prevent all three by using framework auto-escaping and context-specific output encoding, avoiding dangerous DOM sinks, and sanitizing with a strict policy only when rich HTML is intentional. CSP, Trusted Types, and HttpOnly cookies reduce exploitability or impact but do not replace safe output handling.
+
+When reviewing code, trace **source → transformation → sink**. Identify who controls the value, whether any decoder or string concatenation changes it, which parser consumes it, and which contextual protection is applied at the last responsible moment.
+
+The next article, [SSRF: When Your Server Becomes the Attacker's HTTP Client](/writing/ssrf-when-your-server-becomes-the-http-client/), moves the same trust-boundary thinking from the browser to backend network requests.
+
+## References and further reading
+
+- OWASP, [Cross Site Scripting Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html).
+- OWASP, [Content Security Policy Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Content_Security_Policy_Cheat_Sheet.html).
+- OWASP, [Java HTML Sanitizer](https://owasp.org/projects/java-html-sanitizer).
+- Thymeleaf, [Using Thymeleaf: escaped and unescaped text](https://www.thymeleaf.org/doc/tutorials/3.1/usingthymeleaf).
+- MDN, [`Element.innerHTML`](https://developer.mozilla.org/en-US/docs/Web/API/Element/innerHTML).
+- MDN, [Content Security Policy](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CSP).
