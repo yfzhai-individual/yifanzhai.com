@@ -1,0 +1,136 @@
+---
+title: "What 1,000 Services Actually Teach You About System Design"
+description: "Lessons from Matt Ranney's Uber talk on why microservices scale organizations, how tail latency compounds, and why observability, failure testing, and migration must be designed in."
+publishedAt: 2026-09-26
+tags: [system design, microservices, distributed systems, reliability]
+draft: false
+---
+
+import Callout from '../../components/Callout.astro';
+
+System design diagrams make microservices look tidy: draw a few boxes, connect them with arrows, and let each team own one box. Production is where the arrows begin to fight back.
+
+Matt Ranney's 2016 talk, [*What I Wish I Had Known Before Scaling Uber to 1,000 Services*](https://www.youtube.com/watch?v=kb-m2fasdDY), is valuable because it is not a victory lap. Uber had used services to let a rapidly growing engineering organization ship independently, but every new boundary also created another remote call, operational surface, migration, and opportunity for teams to disagree.
+
+The lesson is not “copy Uber.” It is that architecture is a trade: **microservices exchange local development independence for system-wide coordination cost**. A strong system design answer should explain when that exchange is worth paying for and how the resulting complexity will be controlled.
+
+<Callout type="info" title="A historical snapshot, not Uber's current architecture">
+The talk describes Uber around 2016: roughly 2,000 engineers, more than 1,000 production services, and more than 8,000 code repositories. The tools and numbers have changed since then. This article preserves the engineering lessons and translates a few of the practices into modern terms.
+</Callout>
+
+## Microservices scale teams before they scale traffic
+
+The surprising premise of the talk is that traffic was not the main scaling problem. The harder problem was allowing a fast-growing engineering organization to change the product without every release requiring company-wide coordination.
+
+Service boundaries helped Uber form independent teams. A team could own a service, deploy it on its own schedule, choose an appropriate implementation, and be on call for what it ran. This is organizational scaling expressed as software architecture.
+
+But independence is never free. A function call inside one process becomes a **remote procedure call (RPC)** across a network. A code change may become a versioned API migration. Debugging one stack becomes tracing a request across ten services. A shared library upgrade becomes hundreds of repository changes.
+
+This gives us a better opening question than “monolith or microservices?” Ask:
+
+> What constraint requires independent services: team autonomy, deployment cadence, fault isolation, different scaling needs, or a hard security boundary?
+
+If the answer is merely “microservices are modern,” the system probably does not need them. Martin Fowler calls the extra distribution, consistency, and operational work the [microservice premium](https://martinfowler.com/articles/microservice-trade-offs.html). A well-structured modular monolith is often the better starting point when one team can still own and deploy the system safely.
+
+## Every service boundary sends an invoice
+
+An in-process call normally either returns or throws. A remote call adds harder states:
+
+- the request may never arrive;
+- the server may complete it while the response is lost;
+- a timeout may trigger a retry and perform the action twice;
+- the caller and server may run incompatible versions;
+- one slow dependency may consume the caller's entire latency budget.
+
+The talk is especially skeptical of treating internal server calls like browser-facing HTTP APIs. Loosely structured JSON is convenient until one language sends `null`, another expects an empty string, and a third silently converts a number. The modern conclusion is not “HTTP is bad.” It is **make service contracts explicit**: define schemas, validate both ends, preserve backward compatibility, set deadlines, make retryable operations idempotent, and decide what partial failure means.
+
+<Callout type="warning" title="A retry is part of the design, not an automatic fix">
+A caller cannot always tell whether a timed-out request failed before or after changing state. Retrying without an idempotency key or operation identifier can charge, book, or create something twice. Retrying aggressively during overload can also make the outage worse.
+</Callout>
+
+## Standardize the seams, not every implementation
+
+Multiple languages let teams choose useful tools and migrate incrementally. They also make code sharing, profiling, hiring, incident response, and moving engineers between teams harder. “Best tool for the job” is ambiguous when the local benefit belongs to one team but the operational cost belongs to the whole company.
+
+The practical compromise is a small supported technology set plus a **paved road**: templates and libraries that make the safe path the easy path. Every new service should receive the same deployment pipeline, health checks, authentication hooks, dashboards, tracing, structured logging, ownership metadata, and alerting by default. A team may leave that road when it has a reason and accepts the cost.
+
+Repository structure has the same tradeoff. Many repositories strengthen ownership and independent releases, but make cross-cutting changes and code discovery expensive. A monorepo makes large migrations and navigation easier, but requires strong build and access tooling at scale. The interview-quality answer is not that one layout always wins; it is that the organization must support the migrations its layout makes difficult.
+
+## Fan-out turns rare slowness into common slowness
+
+Suppose a request fans out to several dependencies and must wait for all of them. If each dependency is slow 1% of the time, the probability that at least one is slow is:
+
+```text
+P(at least one slow) = 1 - (1 - 0.01)^N
+```
+
+| Dependencies (`N`) | Chance at least one is slow |
+|---:|---:|
+| 1 | 1.0% |
+| 10 | 9.6% |
+| 50 | 39.5% |
+| 100 | 63.4% |
+
+This simplified calculation assumes independent slowdowns; real systems also have correlated failures such as shared databases, networks, and overloaded clusters. The important point survives: averages hide the experience of a request waiting on many branches. Google describes the broader phenomenon in [*The Tail at Scale*](https://research.google/pubs/the-tail-at-scale/).
+
+Measure p95, p99, and p99.9 latency—not only the mean—and inspect the whole request path. Then reduce unnecessary fan-out, run independent calls concurrently, propagate deadlines, cap concurrency, return partial results where the product permits it, and ensure retries have budgets and backoff. A service that is fast in isolation can still make the composed system slow.
+
+## Observability must be part of creating a service
+
+At 1,000 services, asking every team to invent its own monitoring conventions guarantees an incident full of incompatible dashboards and missing data. The talk argues for standard dashboards generated for every service and a common way to profile different languages.
+
+Three signals answer different questions:
+
+- **Metrics** show that latency, traffic, errors, or resource use changed.
+- **Traces** show which path a request took and which dependency consumed its time.
+- **Logs** explain specific events, provided they are structured and tied to the same request or trace context.
+
+Today, [OpenTelemetry context propagation](https://opentelemetry.io/docs/concepts/context-propagation/) is a common way to carry trace context across process and network boundaries. Sampling keeps the cost manageable, but every supported language and transport must propagate the context consistently or the trace breaks at exactly the boundary being investigated.
+
+Logging also needs a failure mode. During an outage, a loop may produce logs faster than the logging pipeline can accept them. If application requests block behind those logs, observability amplifies the outage. Apply backpressure, rate limits, and priority; be willing to drop repetitive low-value logs; and attribute volume to the service producing it.
+
+Finally, know what “healthy” means before the incident. A **service-level indicator (SLI)** is a measurement such as successful-request ratio or latency. A **service-level objective (SLO)** is its target. Google's [SRE guidance](https://sre.google/sre-book/service-level-objectives/) explains why explicit objectives force owners to confront distributed-system behavior early. Perfection is not required, but an unknown baseline is dangerous.
+
+## Test load, failure, and migration as normal states
+
+A large production system is difficult to reproduce in a test environment. The talk describes generating load in production and marking test requests so their context survives every downstream hop. That idea needs guardrails: isolate test accounts and data, cap the blast radius, exclude synthetic traffic from business reporting, define stop conditions, and make rollback immediate.
+
+Failure testing has the same requirement. Killing instances or injecting latency is useful only after the system has monitoring, ownership, and safe boundaries. Start with a small experiment, a hypothesis, and a narrow blast radius. “Chaos” without controls is simply an outage someone scheduled.
+
+Migration is not an exceptional project either. At global scale there is no reliable moment to stop every service, update everything, and start again. Contracts need compatibility windows; old and new paths may run together; progress needs measurement; and rollback must remain possible. The best migration path should also be the easiest path. Teams move faster when the platform supplies automation and visible benefits instead of only issuing mandates.
+
+Security or compliance deadlines may still require enforcement, but force does not replace migration tooling.
+
+## Architecture is also organizational design
+
+Service boundaries can reduce coordination, but they can also become political walls. A team may build around a broken dependency rather than help repair it. Technology choices can form language camps. “You own it” can turn into “not my problem.” The system remains one customer experience even when its code is divided among many owners.
+
+This is why the talk's least technical lesson may be its most important: optimize for the company and the product before the team, and for the team before personal preference. Ownership should identify who responds and improves the service, not excuse everyone else from understanding the complete system.
+
+The same humility applies to build-versus-buy decisions. Infrastructure that once differentiated the company may become a commodity that a vendor can run more safely and cheaply. Teams naturally become attached to what they built. Revisit the decision using current requirements, switching cost, operational risk, and strategic value—not pride.
+
+## A reusable system design interview framework
+
+When an interviewer asks whether a system should use microservices, avoid answering with a list of fashionable components. Walk through this sequence:
+
+1. **Name the pressure.** Is the problem traffic, team coordination, deployment coupling, fault isolation, or security isolation?
+2. **Choose the boundary.** Identify the business capability and data ownership that can change independently.
+3. **Trace one request.** Count remote calls and explain deadlines, retries, idempotency, and partial failure.
+4. **Quantify the risky part.** Estimate fan-out, tail latency, throughput, storage, or blast radius.
+5. **Design the operating model.** State the owner, SLO, dashboard, trace context, on-call path, and overload behavior.
+6. **Explain evolution.** Show how the contract can change, how data migrates, and how the system rolls back without a global maintenance window.
+
+A concise conclusion might sound like this:
+
+> I would begin with the coarsest architecture that lets the current teams deploy safely. I would split a service only when its ownership, scaling, reliability, or security needs justify a network boundary. For every split, I would budget for contract versioning, observability, failure handling, and migration—not just the new service's business logic.
+
+That answer captures the lasting value of the talk. The maturity of a system design is not measured by how many boxes it contains. It is measured by whether the designer understands the invoice attached to every arrow.
+
+## Sources and further reading
+
+- Matt Ranney, [*What I Wish I Had Known Before Scaling Uber to 1,000 Services*](https://www.youtube.com/watch?v=kb-m2fasdDY)
+- High Scalability, [detailed notes from the talk](https://highscalability.com/lessons-learned-from-scaling-uber-to-2000-engineers-1000-ser/)
+- Martin Fowler, [*Microservice Trade-Offs*](https://martinfowler.com/articles/microservice-trade-offs.html)
+- Jeffrey Dean and Luiz André Barroso, [*The Tail at Scale*](https://research.google/pubs/the-tail-at-scale/)
+- OpenTelemetry, [context propagation](https://opentelemetry.io/docs/concepts/context-propagation/)
+- Google SRE, [service-level objectives](https://sre.google/sre-book/service-level-objectives/)
