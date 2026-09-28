@@ -1,0 +1,125 @@
+---
+title: "IAM for Application Security: Identities Have a Lifecycle"
+description: "A practical guide to the identity lifecycle inside a modern application: SSO, SCIM, local accounts, workload identities, revocation, and privileged access."
+publishedAt: 2026-09-27
+tags: [security, IAM, identity, application-security]
+draft: false
+---
+
+import Callout from '../../components/Callout.astro';
+import ServiceArchitectureDiagram from '../../components/ServiceArchitectureDiagram.astro';
+import { appIamLifecycleArchitecture } from '../../data/identity-access-diagrams';
+
+Alice joins Acme and receives access to its expense application. Six months later she becomes a manager. A year later she leaves. The security problem is not only whether Alice can log in on her first day. It is whether every account, session, permission, and credential changes with her throughout that lifecycle.
+
+That is the application-security view of **Identity and Access Management (IAM)**:
+
+> Know which human or workload is acting, give it only the access it currently needs, and remove that access when its identity or job changes.
+
+The [authentication guide](https://yifanzhai.com/writing/access-tokens-refresh-tokens-and-sessions/) explains passwords, sessions, tokens, OAuth, and OpenID Connect (OIDC). Here we begin after those mechanisms can identify a caller.
+
+## The small vocabulary that prevents large mistakes
+
+| Term | Meaning in an application |
+| --- | --- |
+| **Identity** | The person or workload the system is trying to represent, such as Alice or a deployment job. |
+| **Account** | The application's record for that identity. One identity may have accounts in many systems. |
+| **Principal** | The identity, service, or session making the current request. |
+| **Credential** | Evidence used to authenticate, such as a password, passkey, session cookie, API key, or workload token. |
+| **Permission** | A permitted action such as `expense:approve`. |
+| **Role or group** | A manageable collection of access assignments, such as `expense-manager`. |
+| **Resource** | The protected object: an expense, project, file, tenant, or administrative function. |
+
+These terms are related but not interchangeable. Disabling an account does not necessarily invalidate an already-issued session. Removing a user from an Identity Provider (IdP) group does not help if the application copied that group into a long-lived token and never checks again.
+
+## SSO proves identity; the application still owns access
+
+Suppose Acme uses an IdP such as Okta, Microsoft Entra ID, or Google Workspace. Alice signs in through **Single Sign-On (SSO)**, and the application receives a validated OIDC or SAML response. That response can establish which external identity authenticated.
+
+It does not automatically answer whether Alice belongs to tenant `acme`, may approve expense `4182`, or may enter an administrator console. The application must map the stable external identity to a local account and enforce its own business authorization.
+
+Provisioning is a separate path. **System for Cross-domain Identity Management (SCIM)** is an HTTP and JSON standard for creating, updating, and disabling users and groups across systems. For example, an IdP might send a simplified update like this when Alice leaves:
+
+```http
+PATCH /scim/v2/Users/2819
+Authorization: Bearer <provisioning-credential>
+Content-Type: application/scim+json
+
+{
+  "Operations": [
+    { "op": "replace", "path": "active", "value": false }
+  ]
+}
+```
+
+The application should disable Alice's account, reject new logins, and apply its policy for existing sessions, API keys, personal access tokens, and owned resources. SCIM transports the lifecycle signal; it does not design that policy for you.
+
+Some applications instead use **just-in-time provisioning**: the first successful SSO login creates the local account. That is convenient for joining, but it is not a complete lifecycle. A user who never logs in again cannot carry a login-time signal that disables an old account, session, or API credential. Use SCIM, another lifecycle feed, or an explicit reconciliation process when timely deprovisioning matters.
+
+<ServiceArchitectureDiagram diagram={appIamLifecycleArchitecture} />
+
+<Callout type="warning" title="SSO and SCIM solve different problems">
+SSO carries an authentication result during login. SCIM provisions and changes account data outside the login flow. Supporting SSO without reliable deprovisioning can leave dormant local accounts and credentials after the IdP account is disabled.
+</Callout>
+
+## Design the join, move, and leave paths together
+
+The common name is the **joiner–mover–leaver lifecycle**:
+
+- **Join:** Create or link the correct tenant account, assign a minimal starting role, and record who approved exceptional access.
+- **Move:** Remove access from the previous job before or while granting the new access. Otherwise permissions only accumulate—a problem known as **privilege creep**.
+- **Leave:** Disable the account, revoke or bound existing sessions and tokens, remove group and tenant memberships, retire personal credentials, and transfer owned resources.
+
+The important requirement is convergence: how long may old access continue after the source of truth changes? A five-minute delay may be acceptable for a low-risk internal tool and unacceptable for an administrator who was just terminated. Define that window instead of promising “immediate revocation” while caches and hour-long tokens disagree.
+
+Not every assignment comes directly from a job title. Periodic **access reviews** ask an accountable owner whether exceptional, inherited, contractor, and third-party access is still required. External identities should have a sponsor and an expiration date rather than living forever because nobody sent a leaving event.
+
+For sensitive access, add expiration rather than relying on someone to remember removal. A support engineer may receive production access for one incident, with approval, a short lifetime, and an audit trail. This is **just-in-time (JIT) access**, commonly managed through **Privileged Access Management (PAM)**. Apply **separation of duties** where one actor should not control the whole risky workflow—for example, the person requesting elevation should not be its only approver. A separate emergency or **break-glass** account can preserve recovery during an IdP outage, but it should be tightly protected, monitored, and regularly tested.
+
+## Workloads need identities too
+
+A nightly settlement job is also a principal. Giving every deployment, container, and integration the same permanent API key makes attribution and revocation nearly impossible.
+
+A safer default is:
+
+1. The platform authenticates the workload from its runtime identity.
+2. A trusted service issues a short-lived credential for one audience and purpose.
+3. The receiving service authorizes the workload just as it would a human principal.
+
+AWS recommends temporary credentials for both human and workload access, while Google Cloud recommends workload identity federation instead of downloaded service-account keys. Short-lived credentials reduce the useful lifetime of a leak; narrow permissions reduce what the stolen credential can do.
+
+Keep human and workload identities distinguishable in logs and policy. A service acting *for* Alice may need both identities in its context: the service that made the call and the user whose authority was delegated.
+
+<Callout type="info" title="Zero Trust without the slogan">
+Do not grant access merely because a request came from the corporate network or an internal service. Authenticate the principal, authorize the action and resource, use relevant context, and re-evaluate when identity, device, risk, or access state changes. “Never trust” does not mean prompting for a password on every request; it means no network location receives permanent implicit trust.
+</Callout>
+
+## What an AppSec review should look for
+
+| Finding | Why it matters | Better control |
+| --- | --- | --- |
+| SSO account disabled, local sessions remain valid for days | Offboarding does not reach active access | Bound session lifetime and provide a revocation or live account-status path |
+| Group changes only take effect at the next login | Removed privileges remain usable | Refresh current membership for sensitive actions or keep tokens short-lived |
+| Support staff have permanent administrator roles | One compromised account has a large blast radius | Time-bound elevation, approval, step-up authentication, and audit |
+| CI and production share a static API key | Compromise cannot be contained or attributed | Separate workload identities and short-lived scoped credentials |
+| Tenant comes from a request parameter | A caller can select someone else's security boundary | Derive membership from trusted server-side identity data |
+| Nobody owns a service account | Credentials survive the workload and its team | Record an owner, purpose, last use, expiry, and rotation path |
+| Contractor access has no sponsor or expiry | External access survives the business relationship | Require ownership, expiration, and periodic review |
+
+Ask for evidence, not only architecture diagrams: create and disable a test identity, change its group, revoke its session, rotate a workload credential, and confirm the expected audit events. [OWASP ASVS](https://owasp.org/projects/asvs?tab=main) is useful for turning these expectations into repeatable application-security requirements.
+
+## The practical default
+
+For a SaaS application, use a stable external identity such as `(issuer, subject)` for account linking, maintain current tenant memberships and account state server-side, keep application sessions bounded and revocable, and authorize every business action locally. Automate provisioning where customers require it, but make deprovisioning safe even when automation is delayed or unavailable.
+
+For workloads, replace shared long-lived keys with individually attributable, short-lived identities. For privileged humans, make elevated access separate, temporary, strongly authenticated, and visible.
+
+IAM is successful when a team can answer four questions for every request: **Who is this? Which account and tenant does it represent? What access is current? How will that access end?** The companion guide, [Authorization in Practice](https://yifanzhai.com/writing/authorization-in-practice/), takes the next step: deciding whether that principal may perform one particular action on one particular resource.
+
+## References and further reading
+
+- OWASP, [Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html) and [Application Security Verification Standard](https://owasp.org/projects/asvs?tab=main).
+- IETF, [RFC 7643: SCIM Core Schema](https://www.rfc-editor.org/rfc/rfc7643.html) and [RFC 7644: SCIM Protocol](https://www.rfc-editor.org/rfc/rfc7644.html).
+- Microsoft, [What is identity governance?](https://learn.microsoft.com/en-us/entra/id-governance/identity-governance-overview).
+- Amazon Web Services, [Security best practices in IAM](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html).
+- Google Cloud, [Best practices for using Workload Identity Federation](https://docs.cloud.google.com/iam/docs/best-practices-for-using-workload-identity-federation).

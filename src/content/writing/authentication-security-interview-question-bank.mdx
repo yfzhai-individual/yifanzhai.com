@@ -1,8 +1,9 @@
 ---
-title: "Authentication Security Interview Question Bank"
-description: "A curated set of high-frequency authentication interview questions about sessions, tokens, OAuth, MFA, SSO, PKI, lifecycle security, and real-world architecture trade-offs."
+title: "Identity and Access Security Interview Question Bank"
+description: "A curated set of high-frequency interview questions about authentication, IAM, authorization, sessions, tokens, federation, PKI, identity lifecycle, and application-security trade-offs."
 publishedAt: 2026-09-24
-tags: [security, authentication, interviews, system design]
+updatedAt: 2026-09-27
+tags: [security, authentication, IAM, authorization, interviews, system design]
 draft: false
 ---
 
@@ -15,18 +16,20 @@ Use the companion guides for the underlying narrative:
 - [How Modern Web Authentication Fits Together](https://yifanzhai.com/writing/access-tokens-refresh-tokens-and-sessions/) covers passwords, passkeys, sessions, JSON Web Tokens (JWTs), OAuth, OpenID Connect (OIDC), browser and mobile storage, and Single Sign-On (SSO).
 - [MFA Is More Than a Second Prompt](https://yifanzhai.com/writing/mfa-is-more-than-a-second-prompt/) covers factor choice, phishing resistance, enrollment, recovery, and step-up authentication.
 - [From Public Keys to PKI](https://yifanzhai.com/writing/public-keys-certificates-and-pki/) covers key pairs, certificates, trust chains, mutual TLS (mTLS), and certificate lifecycle.
+- [IAM for Application Security](https://yifanzhai.com/writing/iam-for-application-security/) covers application accounts, SSO, SCIM, joiner–mover–leaver controls, workload identity, and privileged access.
+- [Authorization in Practice](https://yifanzhai.com/writing/authorization-in-practice/) covers RBAC, ABAC, ReBAC, policy enforcement, multi-tenant boundaries, and authorization testing.
 
 This question bank keeps only the questions that repeatedly expose meaningful engineering judgment.
 
-## A framework for answering authentication questions
+## A framework for answering identity and access questions
 
 Before naming a protocol or token format, establish five things:
 
-1. **Purpose:** Is the system proving a human identity, continuing a session, delegating API access, or authenticating a workload?
+1. **Purpose:** Is the system proving an identity, continuing a session, delegating API access, or deciding whether a principal may perform an action on a resource?
 2. **Trust boundaries:** Which component issues the credential, which component holds it, and which component accepts it?
 3. **Lifecycle:** How is the credential enrolled or issued, stored, rotated, recovered, revoked, and retired?
 4. **Threats:** Are you defending against password reuse, phishing, Cross-Site Scripting (XSS), Cross-Site Request Forgery (CSRF), session theft, device loss, malicious applications, or workload-secret leakage?
-5. **Failure modes:** What happens when the Identity Provider (IdP), session store, token service, certificate authority, risk engine, or recovery team is unavailable or compromised?
+5. **Failure modes:** What happens when the Identity Provider (IdP), session store, token service, certificate authority, provisioning feed, policy service, or recovery team is unavailable or compromised?
 
 <Callout type="info" title="A useful answer shape">
 State the default you would choose, explain which threat and trust boundary it addresses, name the cost it introduces, and describe the lifecycle and failure behavior. “It depends” becomes a strong answer only after you say what it depends on.
@@ -44,6 +47,8 @@ State the default you would choose, explain which threat and trust boundary it a
 | Central SSO vs application independence | Consistent policy and fast offboarding | Smaller IdP blast radius and outage isolation | Federation validation, local sessions, emergency access, and IdP compromise |
 | Local token or certificate verification vs live lookup | Availability and low request latency | Immediate revocation and current state | Caching, introspection, denial lists, expiry, and fail-open behavior |
 | Public or managed PKI vs self-operated PKI | Lower operational burden and established automation | Direct control over policy and trust roots | Enrollment, key protection, trust distribution, rotation, audit, and incident response |
+| RBAC vs attributes and relationships | Simple administration and explainability | Resource-specific and contextual decisions | Role explosion, source-of-truth quality, policy complexity, and consistency |
+| Local vs centralized authorization | Low latency and service independence | Consistent policy and audit | Bypass paths, decision-service availability, caching, and policy rollout |
 
 There is no strongest architecture independent of context. The useful question is which failure or attack each choice makes easier—and whether the organization can operate the full lifecycle.
 
@@ -149,6 +154,50 @@ An OAuth access token expresses scoped delegated authority at the application la
 
 For certificates, short lifetimes put a hard upper bound on use of a stolen key when revocation status is unavailable or inconsistently enforced. The trade-off is dependence on reliable automated renewal, clock discipline, and trust-bundle rotation.
 
+## IAM and application authorization
+
+### 16. What is the difference between IAM, authentication, and authorization?
+
+Authentication establishes which human or workload is acting. Authorization decides whether that principal may perform one action on one resource. IAM is the wider lifecycle and operating system around both: identity sources, accounts, credentials, federation, provisioning, groups, roles, approvals, reviews, revocation, and audit.
+
+A successful IdP login therefore does not authorize every application action. The application still maps the external identity to a local account and tenant, creates or resumes its own session, and enforces current business permissions.
+
+### 17. How do SSO, SCIM, and just-in-time provisioning differ—and how would you offboard a user?
+
+SSO carries an authentication result during login. SCIM or another lifecycle feed creates, updates, and disables accounts and group memberships outside the login path. Just-in-time provisioning creates an account at the first successful login, but by itself has no reliable way to disable a user who never returns.
+
+On departure, disable the account, reject new federation responses, revoke or bound active sessions and renewal grants, retire personal API credentials, remove tenant and group memberships, and transfer owned resources. State the maximum accepted propagation delay across tokens, caches, applications, and background systems; “the IdP account is disabled” is not a complete offboarding plan.
+
+### 18. When would you use RBAC, ABAC, or ReBAC?
+
+Use Role-Based Access Control (RBAC) for stable job functions and a small, understandable permission vocabulary. Add Attribute-Based Access Control (ABAC) when decisions depend on tenant, data classification, object state, time, device, or other trusted attributes. Use Relationship-Based Access Control (ReBAC) when ownership, membership, management, sharing, or parent-child relationships naturally define access.
+
+Most real systems combine them. A manager role may permit approval generally, a tenant attribute limits the boundary, a management relationship identifies whose expenses are reachable, and object state permits approval only while pending. Discuss role explosion, attribute freshness, relationship consistency, explainability, and who owns each source of truth.
+
+### 19. How would you design authorization for a multi-tenant SaaS application?
+
+Model the decision as `allow(principal, action, resource, context)`. Derive the principal and tenant membership from validated server-side identity state, load the trusted resource, and check role, tenant, ownership or relationship, object state, and relevant context before the business side effect. Never trust a caller-supplied tenant, owner, or role merely because it arrived inside authenticated traffic.
+
+Use gateways for coarse checks, application services for business and object policy, and tenant-scoped repositories or database controls as containment. Cover list, search, export, batch, cache, GraphQL, and background-job paths—not only `GET /object/{id}`. Test positive and negative combinations across users, tenants, actions, and resource states.
+
+### 20. Should authorization be a local library or a central service, and what happens if it is unavailable?
+
+A local library offers low latency and service independence but can drift or be bypassed inconsistently. A central Policy Decision Point improves policy consistency, relationship reuse, versioning, and audit, but adds network latency, availability, cache-freshness, and rollout risk. A practical design may centralize policy and relationship data while keeping enforcement points inside each service.
+
+For sensitive writes and privileged actions, missing policy data or an unavailable decision service should normally deny the request. A product may deliberately serve low-risk reads from a bounded cache, but the accepted staleness, invalidation path, monitoring, and excluded operations must be explicit. “Fail open for availability” is not a neutral decision.
+
+### 21. How do you authenticate workloads without permanent service-account keys?
+
+Use the platform's runtime identity or workload federation to obtain a short-lived credential for one audience and purpose. Give each workload its own attributable principal and minimum permissions instead of sharing a human account or static key. Record an owner, environment, issuer, audience, last use, rotation or renewal path, and emergency revocation method.
+
+When a service acts for a user, preserve both identities: the workload making the call and the user whose authority was delegated. Short lifetime limits how long a stolen credential works; it does not repair an overprivileged policy.
+
+### 22. How would you secure privileged access and emergency access?
+
+Keep everyday and privileged access separate. Grant elevation just in time, for a short duration, after appropriate step-up authentication and approval; log the request, approver, actions, and expiry. Apply separation of duties so one actor cannot request, approve, and conceal the same risky action. Periodically review permanent exceptions and external access.
+
+Maintain a tightly protected break-glass path for an IdP or policy-system outage. Exclude it from ordinary dependencies, require strong independently recoverable credentials, alert on every use, and test it without normalizing its use. A break-glass account that has never been tested is only a theory; one used for convenience is a standing back door.
+
 ## Practical defaults by scenario
 
 | Scenario | A defensible starting point |
@@ -172,6 +221,8 @@ The recurring pattern is to use the strongest control that the entire lifecycle 
 - “PKCE protects the access token.”
 - “SSO means all applications share a cookie.”
 - “A valid certificate automatically authorizes the request.”
+- “The user has the manager role, so every manager action is allowed.”
+- “SSO offboarding automatically revokes every application session and API key.”
 - “We will revoke it” without naming the state, propagation path, and accepted delay.
 
 A senior answer separates authentication, session continuity, delegation, and authorization—and then explains how compromise, recovery, revocation, and dependency failure change the design.
@@ -179,7 +230,11 @@ A senior answer separates authentication, session continuity, delegation, and au
 ## Primary references
 
 - NIST, [SP 800-63B-4: Authentication and Authenticator Management](https://pages.nist.gov/800-63-4/sp800-63b.html).
-- OWASP, [Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html), [Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html), and [OAuth 2.0 Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/OAuth2_Cheat_Sheet.html).
+- OWASP, [Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html), [Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html), [OAuth 2.0 Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/OAuth2_Cheat_Sheet.html), and [Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html).
+- NIST, [Role-Based Access Control](https://csrc.nist.gov/projects/role-based-access-control) and [SP 800-162: Guide to Attribute-Based Access Control](https://csrc.nist.gov/pubs/sp/800/162/upd2/final).
+- IETF, [RFC 7643: SCIM Core Schema](https://www.rfc-editor.org/rfc/rfc7643.html) and [RFC 7644: SCIM Protocol](https://www.rfc-editor.org/rfc/rfc7644.html).
+- Google Research, [Zanzibar: Google's Consistent, Global Authorization System](https://research.google/pubs/zanzibar-googles-consistent-global-authorization-system/).
+- Amazon Web Services, [IAM policy evaluation logic](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html).
 - IETF, [RFC 9700: Best Current Practice for OAuth 2.0 Security](https://www.rfc-editor.org/rfc/rfc9700.html).
 - IETF, [RFC 10017: OAuth 2.0 for Browser-Based Applications](https://www.rfc-editor.org/rfc/rfc10017.html).
 - IETF, [RFC 8252: OAuth 2.0 for Native Apps](https://www.rfc-editor.org/rfc/rfc8252.html).

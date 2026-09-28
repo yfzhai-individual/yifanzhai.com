@@ -1,0 +1,188 @@
+---
+title: "Authorization in Practice: Who Can Do What to Which Resource?"
+description: "A practical application-security guide to RBAC, ABAC, ReBAC, enforcement points, Java authorization checks, multi-tenant boundaries, testing, and failure behavior."
+publishedAt: 2026-09-27
+tags: [security, authorization, access-control, application-security, Java]
+draft: false
+---
+
+import Callout from '../../components/Callout.astro';
+import ServiceArchitectureDiagram from '../../components/ServiceArchitectureDiagram.astro';
+import { applicationAuthorizationArchitecture } from '../../data/identity-access-diagrams';
+
+Alice is a manager at Acme. She sends this request:
+
+```http
+POST /api/expenses/4182/approve
+Cookie: session=<opaque-value>
+```
+
+Her session proves which principal made the request. It does not prove that expense `4182` belongs to Acme, that Alice manages its owner, that the expense is awaiting approval, or that Alice is allowed to approve her own claim.
+
+Authorization reduces those questions to one decision:
+
+```text
+allow(principal, action, resource, context)?
+```
+
+For this request: **May Alice perform `expense:approve` on expense `4182`, under the current tenant, relationships, object state, and policy?**
+
+## Authentication supplies a principal, not permission
+
+- **Authentication** establishes who or what is making the request.
+- **Authorization** decides whether that principal may perform an action on a resource.
+- **Access control** is the mechanism that evaluates and enforces that decision.
+- **Policy** is the rule being evaluated.
+- **Entitlement** is an assigned capability such as a role, group membership, or permission.
+
+A valid session, JSON Web Token (JWT), API key, or client certificate is an input to authorization—not a blanket allow. OWASP recommends least privilege, deny by default, and permission validation on every request because an attacker needs only one unprotected path.
+
+## Four models explain most application policies
+
+| Model | Simple mental model | Useful for | Common trap |
+| --- | --- | --- | --- |
+| **Access Control List (ACL)** | The resource lists who may do what | A document shared with named people | Permissions become difficult to review across many resources |
+| **Role-Based Access Control (RBAC)** | Principals receive roles; roles contain permissions | Stable job functions such as employee, manager, and billing admin | Creating a new role for every exception or resource scope |
+| **Attribute-Based Access Control (ABAC)** | Evaluate attributes of the principal, resource, action, and environment | Tenant, region, data classification, time, device, or object-state rules | Using stale or untrusted attributes and producing policies nobody can explain |
+| **Relationship-Based Access Control (ReBAC)** | Permission follows a relationship such as owner, member, parent, or manager | Collaboration, projects, folders, organizations, and sharing | Treating the relationship graph's consistency and authorization latency as someone else's problem |
+
+[NIST defines RBAC](https://csrc.nist.gov/glossary/term/role_based_access_control) around roles and their permitted actions. Its [ABAC guidance](https://csrc.nist.gov/pubs/sp/800/162/upd2/final) describes evaluating subject, object, operation, and sometimes environment attributes. Google's [Zanzibar paper](https://research.google/pubs/zanzibar-googles-consistent-global-authorization-system/) is the best-known production example of a relationship-based system used for products such as Drive, Calendar, and Photos.
+
+Real applications rarely choose exactly one. Acme's rule might combine all three:
+
+```text
+allow when
+  principal.tenantId == expense.tenantId
+  and principal has role MANAGER
+  and principal manages expense.owner
+  and expense.status == PENDING
+  and principal.id != expense.ownerId
+```
+
+The role grants the general function. Tenant and status are attributes. “Manages” is a relationship. The useful design question is not “Which acronym wins?” but “Which trusted facts are necessary for this decision?”
+
+<Callout type="info" title="OAuth scopes are not application roles">
+An OAuth scope limits what a client or access token may request from an API. A role groups permissions assigned to a principal, while ownership and relationships constrain which resources those permissions reach. A request may need all three: the token has `expense:approve`, Alice is a manager, and expense `4182` belongs to a direct report in her tenant.
+</Callout>
+
+## Put enforcement before the side effect
+
+A **Policy Enforcement Point (PEP)** intercepts the operation, asks for a decision, and enforces the result. A **Policy Decision Point (PDP)** evaluates the policy. They may be two modules in one process or separate services; the trust boundary matters more than the deployment vocabulary.
+
+<ServiceArchitectureDiagram diagram={applicationAuthorizationArchitecture} />
+
+An application may keep simple policy in code or use a policy engine such as [Open Policy Agent](https://www.openpolicyagent.org/docs), which separates decision-making from enforcement. A central service can improve consistency and audit, but it also adds latency, availability, cache-freshness, and rollout concerns. Do not build a network dependency merely to replace a clear local check.
+
+For a sensitive operation, default to deny when required policy data or the decision service is unavailable. If a low-risk read path deliberately uses cached decisions, document the accepted staleness and never silently apply that exception to writes or administration.
+
+## A role check is usually not enough
+
+This Spring controller looks protected:
+
+```java
+@PostMapping("/api/expenses/{expenseId}/approve")
+@PreAuthorize("hasRole('MANAGER')")
+Expense approve(@PathVariable long expenseId) {
+    return expenses.approve(expenseId);
+}
+```
+
+It proves only that Alice has a manager role. If `expenses.approve` loads a global ID, Alice may approve another tenant's expense or an employee she does not manage.
+
+A safer service loads the trusted resource and evaluates the complete decision before changing it:
+
+```java
+Expense approve(AppPrincipal principal, long expenseId) {
+    Expense expense = expenses.findById(expenseId)
+            .orElseThrow(notFound());
+
+    AuthorizationRequest request = new AuthorizationRequest(
+            principal,
+            "expense:approve",
+            expense,
+            RequestContext.current()
+    );
+
+    authorization.requireAllowed(request);
+    return expenses.approve(expense);
+}
+```
+
+The policy receives tenant and user identity from the validated principal and authoritative application data—not a caller-supplied `tenantId`, `ownerId`, or `role`. The business write runs only after an allow decision.
+
+For simple ownership, make the database query part of the boundary:
+
+```java
+return expenses.findByIdAndTenantIdAndOwnerId(
+        expenseId,
+        principal.tenantId(),
+        principal.userId()
+).orElseThrow(notFound());
+```
+
+That pattern prevents a global row from entering the request path. More complicated sharing, delegation, or administrative rules belong in a consistent policy layer. A dedicated Broken Object Level Authorization (BOLA), also known as Insecure Direct Object Reference (IDOR), review should test this object-level failure in depth.
+
+## Enforce at every path that can reach the resource
+
+Authorization is usually defense in depth, not one annotation:
+
+- **Gateway or router:** coarse function, audience, or scope checks. It usually cannot decide whether Alice owns expense `4182`.
+- **Application service:** business action, tenant, object state, ownership, and relationship checks.
+- **Repository or database:** tenant-scoped queries, row-level security, and constraints that limit mistakes above it.
+- **Response construction:** field-level authorization for salaries, secrets, private comments, or regulated data.
+- **Asynchronous paths:** background jobs and queue consumers must preserve the initiating principal or use an explicitly authorized workload identity.
+
+Apply the same reasoning to list, search, count, export, batch, GraphQL, attachment, restore, and administrative endpoints. Protecting `GET /expenses/{id}` while `/expenses/export` ignores tenant scope is still broken access control.
+
+<Callout type="warning" title="Token claims can become stale">
+A signed role or group claim proves what the issuer stated when the token was issued. It does not prove that the assignment is still current. Use appropriately short lifetimes, current server-side checks for sensitive access, or a revocation/version mechanism when fast permission removal matters.
+</Callout>
+
+## Effective access is the final result, not one policy file
+
+An application may receive permissions from a role, resource ACL, parent organization, delegated relationship, and organization-wide guardrail. Define how they combine.
+
+A defensible default is:
+
+1. No matching allow means implicit deny.
+2. Guardrails and explicit denies can restrict otherwise granted access.
+3. The narrowest tenant and resource boundary still applies.
+4. Every decision records which policy version and trusted facts produced it.
+
+AWS IAM is a useful concrete example: requests are implicitly denied, an applicable allow is required, and an explicit deny overrides an allow. Your product does not need to copy AWS policy syntax, but it should have equally explainable conflict rules.
+
+## Test a matrix, not only the happy path
+
+Create known principals and resources, then test positive and negative combinations:
+
+| Principal | Resource | Action | Expected result |
+| --- | --- | --- | --- |
+| Employee Alice | Alice's draft expense | Edit | Allow |
+| Employee Alice | Bob's expense | Edit | Deny |
+| Manager Maria | Direct report's pending expense | Approve | Allow |
+| Manager Maria | Her own expense | Approve | Deny |
+| Acme administrator | Other tenant's expense | Read | Deny |
+| Support engineer | Acme expense without active elevation | Read | Deny |
+
+Repeat the matrix for alternate API versions, bulk operations, exports, jobs, and cached responses. Then change a role or relationship and test how quickly access disappears. A strong authorization test suite verifies revocation and denial, not only successful access.
+
+Log the principal, tenant, action, resource type and identifier, allow or deny result, reason, and policy version. Do not log entire tokens or sensitive resource contents. Repeated cross-tenant denials are useful detection signals, but monitoring is not a substitute for enforcement.
+
+## The AppSec review in six questions
+
+1. Where does the server prove that this principal may perform this action on this resource?
+2. Which decision inputs come from trusted sources, and how fresh are they?
+3. Can another route, batch request, background job, cache, or export bypass the check?
+4. How do tenant boundaries and object relationships constrain a broad role?
+5. What happens when policy data or the decision mechanism is unavailable?
+6. How quickly do role, relationship, account, and emergency revocations take effect?
+
+If the team can answer those questions with code, tests, and observable behavior, it has an authorization design. If the answer is only “the user already logged in,” it has an authentication system and an access-control vulnerability waiting to happen.
+
+## References and further reading
+
+- OWASP, [Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html) and [Application Security Verification Standard](https://owasp.org/projects/asvs?tab=main).
+- NIST, [Role-Based Access Control](https://csrc.nist.gov/projects/role-based-access-control) and [SP 800-162: Guide to Attribute-Based Access Control](https://csrc.nist.gov/pubs/sp/800/162/upd2/final).
+- Google Research, [Zanzibar: Google's Consistent, Global Authorization System](https://research.google/pubs/zanzibar-googles-consistent-global-authorization-system/).
+- Amazon Web Services, [Policy evaluation logic](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html).
+- Open Policy Agent, [Policy-based control for cloud native environments](https://www.openpolicyagent.org/docs).
