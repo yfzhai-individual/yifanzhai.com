@@ -2,6 +2,7 @@
 title: "Designing a Hotel Booking Service Like Expedia"
 description: "Designing a hotel search and booking aggregator that connects travelers to prices and inventory from thousands of hotel suppliers."
 publishedAt: 2026-10-04
+updatedAt: 2026-10-04
 tags: [system design, distributed systems, security, payments]
 draft: false
 ---
@@ -35,7 +36,7 @@ To support these features, the system must ingest hotel information, prices, and
 1. **Availability and latency:** Prioritize availability for browsing, with search responses under **500 ms at p95**. Search may show a recent snapshot; it must not imply that displayed inventory is already reserved.
 2. **Booking consistency:** Acquire internal holds atomically across **every night of the stay**, so competing customers cannot claim the same locally available capacity. Confirm a booking only after the supplier has reserved the requested room quantity for every night and the required payment outcome is verified. Internal holds coordinate our customers; the supplier resolves competition from other booking sites.
 3. **Scalability:** Support **thousands of supplier integrations** and a read-heavy workload. For this exercise, assume **100,000 properties, 10,000 peak searches/second, and 100 peak booking attempts/second**; these are sizing assumptions, not Expedia's actual traffic.
-4. **Durability and recovery:** Preserve accepted booking requests and verified supplier/payment outcomes across failures. Retries must not create duplicate reservations or charges. An ambiguous external timeout remains pending until resolved; a slow supplier must not block unrelated suppliers.
+4. **Durability and recovery:** Preserve accepted booking requests and verified supplier/payment outcomes across failures. Retries must not create duplicate reservations or charges. An ambiguous external timeout remains pending until resolved or a recovery deadline starts compensation; a slow supplier must not block unrelated suppliers.
 5. **Security:** Authenticate booking actions, authorize access to each user's bookings, protect traveler information, and verify supplier/payment messages. Collect card details through provider-hosted payment fields or checkout; our application receives payment references and must not receive, store, or log raw card details. Clients cannot set the final payable amount or declare a booking paid.
 
 ## Core Entities
@@ -235,7 +236,7 @@ This example represents a failed payment attempt while the internal hold is stil
 | `held` | The internal hold is active and checkout can continue. |
 | `pending` | Confirmation is in progress or an external outcome is being reconciled. |
 | `expired` | The checkout window ended without an active confirmation attempt; the internal allocation is released automatically. |
-| `failed` | The booking could not be completed, for example because the supplier rejected the reservation. |
+| `failed` | Fulfillment failed because the supplier rejected it or its resolution deadline passed; refund/cancellation recovery may still be in progress. |
 | `confirmed` | The supplier reservation and required payment outcome are verified. |
 
 Payment state is returned separately as `not_started`, `pending`, `succeeded`, `failed`, `refund_pending`, or `refunded`. This lets the UI show **Payment failed** while the booking remains `held`, or show refund progress for a failed booking. `can_retry_payment` is computed by the server from the current state and hold deadline; the confirm endpoint checks both again before accepting a retry.
@@ -300,7 +301,7 @@ For example, a customer searching for “Harbr Hotel” within five miles of the
 
 ![Search design with Elasticsearch: the Search Service queries Elasticsearch and PostgreSQL. A CDC pipeline updates Elasticsearch from PostgreSQL, while booking and supplier ingestion retain their database connections.](/images/writing/hotel-booking-search-elasticsearch.png)
 
-The search path becomes:
+Before caching, the search path becomes:
 
 1. The Search Service queries Elasticsearch for a ranked batch of matching hotel IDs.
 2. It checks those hotels' room availability and stay prices in PostgreSQL.
@@ -316,11 +317,23 @@ Use **change data capture (CDC)** to keep the hotel index updated from PostgreSQ
 - **Operational cost:** Elasticsearch adds another cluster to size, monitor, and recover.
 - **End-to-end latency:** Faster hotel discovery does not guarantee the 500 ms target. Candidate retrieval and PostgreSQL availability checks share that budget; measure the full request under representative load.
 
-We can add Redis caching as a separate optimization later. For this step, Elasticsearch handles hotel discovery and PostgreSQL handles date-specific availability.
+#### Scale the availability reads with Redis
+
+Elasticsearch removes discovery work from PostgreSQL, but checking room-nights for every search can still overload it. Add **cache-aside Redis** for reusable availability and rate snapshots. The Search Service reads Redis first and loads missing data from PostgreSQL; Redis does not query the database itself.
+
+Cache inventory by `(hotel, supplier, room_type, date)` and fetch candidate keys in batches. Cache rates separately with their required rate-plan, occupancy, currency, and stay dimensions. This reuses hot hotel data across different searches. A location alone is not a safe key for priced booking options. Whole search-result caching is optional and must include all query parameters, sorting, and pagination.
+
+Start with a **15–30 second TTL plus jitter** as a tuning assumption. Each value retains its supplier observation time: renewing a cache entry does not make an old supplier snapshot fresh. Reject snapshots beyond the supplier freshness policy. Committed inventory and rate changes trigger asynchronous invalidation through CDC or an outbox; TTL limits how long a missed invalidation survives. Invalidation and cache fills can race, so this remains a best-effort search view. [Redis expiration](https://redis.io/docs/latest/commands/expire/).
+
+On misses, batch the indexed queries from the next section against a **PostgreSQL read replica**, with a separate connection pool and concurrency budget. Coalesce concurrent refreshes for the same keys, cap candidate batches and stay length, and stop candidate expansion at the request deadline. Replica lag is acceptable for browsing, but must be monitored alongside supplier age. Holds and booking-state reads use the primary.
+
+**Challenges:** A cold cache or Redis outage must not send unlimited reads to PostgreSQL. Apply admission control to fallback reads; when capacity is exhausted, return explicitly incomplete results or a retryable search error. Measure hit rate, miss-path p95, replica lag, and database load under both warm-cache and cold-cache tests before claiming the latency target. If varied searches keep missing, build a dedicated availability read model rather than continually increasing load on booking storage.
+
+Use a **CDN** for public hotel photos and versioned static assets. Authenticated booking responses and payment details stay out of shared caches. Neither Redis nor the CDN reserves inventory; checkout still checks the primary and obtains supplier confirmation.
 
 ### 2. How can we efficiently find available rooms across a date range?
 
-Elasticsearch gives us candidate hotel IDs. PostgreSQL must now answer: **which supplier and room type can provide the requested quantity on every night of the stay?**
+Elasticsearch gives us candidate hotel IDs. On a Redis cache miss, our PostgreSQL read replica must answer: **which supplier and room type can provide the requested quantity on every night of the stay?**
 
 #### Structure the table around room-nights
 
@@ -333,6 +346,7 @@ CREATE TABLE room_night_availability (
     room_type_id    uuid NOT NULL,
     stay_date       date NOT NULL,
     available_count integer NOT NULL CHECK (available_count >= 0),
+    sales_paused    boolean NOT NULL DEFAULT false,
 
     PRIMARY KEY (hotel_id, supplier_id, room_type_id, stay_date)
 );
@@ -380,6 +394,7 @@ SELECT
     MIN(available_count) AS rooms_available_for_stay
 FROM room_night_availability
 WHERE hotel_id = ANY($1::uuid[])
+  AND NOT sales_paused
   AND stay_date >= $2::date
   AND stay_date <  $3::date
 GROUP BY hotel_id, supplier_id, room_type_id
@@ -402,7 +417,7 @@ Grouping by supplier and room type prevents combining different room categories 
 
 **Performance and correctness limits:** Batch candidate hotels in one query instead of querying each hotel separately. Inspect `EXPLAIN (ANALYZE, BUFFERS)` with representative data before adding more indexes. A covering index may reduce reads, but frequently updated availability rows can still require heap access and add index maintenance costs. [PostgreSQL covering indexes](https://www.postgresql.org/docs/current/indexes-index-only-scans.html).
 
-This query does not reserve rooms. The hold operation must atomically recheck and claim local capacity, and the supplier still decides final reservation availability.
+Paused nights are excluded, so the night-count check rejects the entire stay if any night is paused. This query does not reserve rooms. The hold operation must atomically recheck and claim local capacity, and the supplier still decides final reservation availability.
 
 ### 3. How can we improve the booking experience by temporarily reserving rooms?
 
@@ -445,7 +460,7 @@ The Booking Service generates a booking UUID and resolves the selected option in
 ```sql
 BEGIN;
 
-SELECT stay_date, available_count
+SELECT stay_date, available_count, sales_paused
 FROM room_night_availability
 WHERE hotel_id = :hotel_id
   AND supplier_id = :supplier_id
@@ -457,7 +472,7 @@ FOR UPDATE;
 
 -- Application checks before proceeding:
 -- 1. Row count equals check_out - check_in.
--- 2. Every available_count >= room_count.
+-- 2. Every available_count >= room_count and sales_paused is false.
 -- If either fails: ROLLBACK and return UNAVAILABLE.
 
 UPDATE room_night_availability
@@ -604,6 +619,18 @@ Provider idempotency records have retention limits. Do not blindly retry an unre
 
 On the frontend, disable Pay immediately while submission is in progress and show “Processing.” After a timeout, use `GET /v1/bookings/{booking_id}` to recover the current state. Payment success still requires supplier reservation confirmation before the booking becomes `confirmed`.
 
+#### Bound recovery when only one external operation succeeds
+
+Persist `resolution_deadline`, `recovery_status`, and the next reconciliation time with the booking. For example, after two minutes of uncertainty, escalate to an operator; after a stated customer deadline such as fifteen minutes, stop promising fulfillment and start compensation. These are business-policy examples, adjusted for supplier contracts and check-in proximity.
+
+| Known outcome | Recovery |
+| --- | --- |
+| Payment succeeded; supplier uncertain | Keep the booking pending and tell the customer it is not confirmed. Query by the stable reservation reference; never issue a new reservation blindly. |
+| Supplier rejected, or the resolution deadline passed | Mark fulfillment failed and, if payment was captured, durably enqueue an idempotent refund; and show `refund_pending` until verified. Request cancellation of any possible supplier reservation. |
+| Supplier confirms after compensation started | Continue cancellation/refund recovery; do not silently confirm a booking already reported as failed. Escalate cancellation failures to operations. |
+
+A deadline determines our customer-facing action; it cannot prove what happened at an unreachable supplier. Keep unresolved allocations quarantined from resale until reservation/cancellation reconciliation is safe, even after a refund. Recovery workers track this separately from booking status, alert on aging cases, and close the case only when financial and supplier outcomes are resolved. Where payment methods support it, authorizing first and capturing after supplier confirmation reduces refund cases, but authorization expiry and failed capture still need recovery. [Separate authorization and capture](https://docs.stripe.com/payments/place-a-hold-on-a-payment-method).
+
 ### 5. How do we efficiently ingest supplier data and handle supplier outages?
 
 The **Supplier Ingestion Service** maintains our local snapshots independently of customer searches. Use scheduled polling as the baseline and supplier webhooks where available. Each integration has its own capabilities and rate limits; our room-night model assumes the supplier exposes suitable inventory data. Suppliers that only return quotes for specific stays require a different adapter and quote-cache strategy.
@@ -693,36 +720,52 @@ Deduplicate by supplier and event ID. Write the received event and an outbox ent
 | Read-only checkout revalidation fails | Return a retryable error without proceeding to payment; do not extend the internal hold indefinitely. |
 | Reservation call times out | Keep the booking pending: the supplier may have accepted it. Reconcile using the booking reference or retry with the same supported idempotency key. |
 
-If the supplier lacks idempotent booking and status lookup, do not blindly repeat an uncertain reservation request; it may require supplier support or manual reconciliation. If payment already succeeded, preserve that outcome and resolve the reservation before deciding whether to refund.
+If the supplier lacks idempotent booking and status lookup, do not blindly repeat an uncertain reservation request; it may require supplier support or manual reconciliation. If payment already succeeded, preserve that outcome and follow the resolution deadline and compensation policy from the payment deep dive.
 
 **Protect internal holds during ingestion.** Store raw supplier counts, source versions, and observation times separately from our mutable `available_count`. Applying a refresh must use the same room-night locks as booking operations and account for allocations not yet reflected in the supplier snapshot. When that cannot be determined reliably, preserve existing claims and reconcile conservatively rather than advertise newly freed capacity. Ingestion must never reset the counter to the latest raw supplier count and erase active holds.
 
+#### What if a refresh reports fewer rooms than our existing claims?
+
+Our adapter normalizes the supplier's reported count to **remaining inventory**, not total rooms. Do not subtract all confirmed bookings again if the supplier has already accounted for them. Reconcile against the supplier version/checkpoint and only subtract local claims not reflected in that snapshot, plus a configurable safety buffer. The buffer reduces rejection risk; it cannot guarantee inventory against other sales channels.
+
+If the refreshed capacity cannot cover those claims, set `sales_paused` on the affected room-nights under the same locks used by holds. Keep existing allocation records, invalidate search snapshots, and reject new holds for those nights while reconciling. Do not silently revoke supplier-confirmed reservations or let expiry increments reopen paused inventory. If the supplier cannot establish which claims are reflected, keep sales paused until reconciled. Recompute the remaining capacity before clearing the flag.
+
+For example, if the supplier reports one remaining room but we have two local holds it has not seen, we stop new sales. Both holds remain provisional; only a successful supplier reservation guarantees fulfillment. Show this clearly during checkout. Use shorter freshness limits, larger buffers, or earlier supplier holds for products with high rejection rates.
+
 Monitor job lag, snapshot age, rate-limit responses, and booking-time supplier rejections. Background outages can reduce freshness; they must not turn an unknown reservation outcome into a false confirmation or a duplicate booking.
+
+### 6. How do we recover if PostgreSQL fails during checkout?
+
+Use one writable primary with a synchronous standby in another availability zone. Acknowledge critical booking, idempotency, payment, and outbox writes only after WAL is durably flushed on both. If that durability requirement cannot be met, pause checkout writes rather than silently acknowledge weaker durability. Failover must fence the old primary before promoting an eligible standby. Separate asynchronous read replicas serve search misses. [PostgreSQL synchronous replication](https://www.postgresql.org/docs/current/warm-standby.html#SYNCHRONOUS-REPLICATION).
+
+If a commit succeeded but the response was lost, the client retries with the same key and receives the recorded result. If the crash occurred after an external call, recovery resumes the persisted operation and queries the provider before retrying. Database replication cannot make supplier and payment calls atomic.
+
+For regional disasters, keep cross-region WAL archives/backups and test restoration. Asynchronous disaster recovery has a nonzero data-loss window; define recovery objectives explicitly and reconcile external operations before reopening affected bookings. A zero-loss regional requirement would need cross-region synchronous durability and its latency/availability tradeoff.
 
 ## Final Design
 
-Our final design separates hotel discovery, supplier ingestion, and booking coordination. PostgreSQL stores local inventory and booking state; Elasticsearch provides the hotel search index.
+Our final design separates hotel discovery, supplier ingestion, and booking coordination. Elasticsearch finds hotels, Redis serves reusable availability/rate snapshots, and the CDN serves public static assets. PostgreSQL remains the durable store for inventory allocations and bookings, with read replicas for bounded search-cache misses.
 
 <a href="/images/writing/hotel-booking-final-design.png" target="_blank" rel="noopener noreferrer" aria-label="Open the final hotel booking architecture diagram at full resolution in a new tab">
-  <img src="/images/writing/hotel-booking-final-design.png" alt="Final hotel booking design connecting the API Gateway to Search and Booking Services, PostgreSQL, Elasticsearch through CDC, supplier ingestion through a scheduler and job queue, optional supplier webhooks, and external payment and reservation APIs." loading="lazy" style={{ cursor: 'zoom-in', maxWidth: '100%', height: 'auto' }} />
+  <img src="/images/writing/hotel-booking-final-design.png" alt="Final hotel booking design with CDN delivery to customers, Elasticsearch hotel discovery, Redis search caching backed by PostgreSQL, transactional booking, scheduled supplier ingestion through a job queue, supplier webhooks, and external payment and reservation APIs." loading="lazy" style={{ cursor: 'zoom-in', maxWidth: '100%', height: 'auto' }} />
 </a>
 
 [Open the full-resolution diagram to zoom in](/images/writing/hotel-booking-final-design.png).
 
-The Scheduler Service and Job Queue are external components. PostgreSQL stores supplier configuration, sync checkpoints, and run results; ingestion workers consume the queue. Ingestion workers write normalized supplier responses back to PostgreSQL, although that return connection is omitted from the drawing. The webhook connection represents durable receipt followed by validated ingestion, not an unchecked overwrite of inventory.
+The Redis-to-database arrow represents cache-aside reads performed by the Search Service. The database symbol includes a primary, standby, and search read replicas; it is not one unreplicated node. The Payment SDK runs inside the Booking Service. The Scheduler Service and Job Queue are external components. PostgreSQL stores supplier configuration, sync checkpoints, and run results; ingestion workers consume the queue. Ingestion workers write normalized supplier responses back to PostgreSQL, although that return connection is omitted from the drawing. The webhook connection represents durable receipt followed by validated ingestion, not an unchecked overwrite of inventory.
 
 ### Search flow
 
 1. The customer submits location, dates, guest count, room count, and filters through the API Gateway.
 2. The Search Service queries Elasticsearch for matching hotel IDs.
-3. It checks PostgreSQL for room types with sufficient availability on **every requested night**, then applies pricing and booking restrictions.
-4. It returns paginated hotels with booking options. Search uses local snapshots; checkout revalidates the selected option with the supplier.
+3. It batch-reads availability and rate snapshots from Redis. Cache misses use bounded queries against a PostgreSQL read replica and populate Redis with short TTLs.
+4. It checks **every requested night**, applies pricing and restrictions, and returns paginated booking options. Search remains best-effort; holds check the primary and checkout revalidates with the supplier. The CDN serves public photos and static assets.
 
 ### Supplier ingestion flow
 
 1. The external scheduler publishes refresh jobs to the durable queue, and ingestion workers consume them.
 2. Workers fetch catalog, pricing, and availability updates within each supplier's rate limits. Optional webhooks trigger targeted refreshes or supply versioned updates.
-3. Workers normalize and reconcile the data in PostgreSQL, preserving internal holds and accounting for existing reservations. CDC updates the hotel search index in Elasticsearch.
+3. Workers normalize and reconcile the data in PostgreSQL, preserving internal holds and accounting for existing reservations. CDC updates the hotel search index in Elasticsearch; committed availability/rate changes also trigger Redis invalidation.
 4. Failed jobs retry with backoff. We retain the last good snapshot and suppress bookable options once that data exceeds its freshness limit.
 
 ### Booking flow
@@ -733,8 +776,8 @@ The Scheduler Service and Job Queue are external components. PostgreSQL stores s
 4. When the customer clicks Pay, the client submits a payment-method token and an idempotency key reused for retries of that attempt.
 5. The Booking Service verifies ownership and the deadline, records the attempt, and atomically changes the booking to `pending`.
 6. It revalidates the option, obtains a supplier hold where supported, and coordinates payment and reservation confirmation. Stable external-operation keys protect retries.
-7. Once both outcomes are verified, the booking becomes `confirmed`. Uncertain outcomes stay `pending` for reconciliation. The customer can check `GET /v1/bookings/{booking_id}` at any time.
-8. A periodic worker expires abandoned `held` bookings and restores their room-night counts exactly once. It does not release unresolved `pending` bookings.
+7. Once both outcomes are verified, the booking becomes `confirmed`. Uncertain outcomes stay `pending` until resolved or the recovery deadline starts compensation, with refund/cancellation progress tracked separately. The customer can check `GET /v1/bookings/{booking_id}` at any time.
+8. A periodic worker expires abandoned `held` bookings and restores their room-night counts exactly once. Unresolved external allocations remain quarantined until safe to release; paused inventory is not reopened by expiry.
 
 ### Final data model
 
@@ -792,6 +835,7 @@ RoomNightAvailability
   stay_date
   supplier_reported_count
   available_count
+  sales_paused             blocks new holds during reconciliation
   source_version
   observed_at
 
@@ -799,7 +843,7 @@ RoomNightAvailability
   INDEX (hotel_id, stay_date)
 ```
 
-`supplier_reported_count` is the latest raw supplier count; `available_count` is the reconciled capacity our service can allocate. Holds decrement the latter, and expiry restores it. Refreshes must preserve allocations and avoid counting confirmed reservations twice. `source_version` is nullable when the supplier provides no version; `observed_at` records when we obtained the snapshot.
+`supplier_reported_count` is the latest raw supplier count; `available_count` is the reconciled capacity our service can allocate. Holds decrement the latter, and expiry restores it; `sales_paused` overrides that count until reconciliation completes. Refreshes must preserve allocations and avoid counting confirmed reservations twice. `source_version` is nullable when the supplier provides no version; `observed_at` records when we obtained the snapshot.
 
 #### Bookings and their nightly allocations
 
@@ -816,6 +860,9 @@ Booking
   room_count
   status
   hold_expires_at
+  resolution_deadline
+  recovery_status
+  next_reconcile_at
   quoted_total_minor
   currency
   booking_terms_snapshot
@@ -877,5 +924,7 @@ A booking may have multiple payment attempts after definitive declines, but only
 | **OutboxEvent** | Event ID, event type, related booking or sync ID, payload, and delivery state. Written with the associated database change for reliable notifications and webhook-to-queue delivery. |
 
 Useful operational indexes include `Booking(customer_id, created_at)` for customer history, `Booking(hold_expires_at) WHERE status = 'held'` for expiry scans, `PaymentAttempt(booking_id)` for payment lookup, and `SupplierSyncRun(sync_id, status)` for sync-run lookup. Refresh scheduling and delivery are handled by the external scheduler and queue.
+
+Redis snapshots and CDN assets are disposable derived data, not additional authoritative tables. Recovery workers also index `Booking(next_reconcile_at)` for unresolved recovery cases.
 
 Booking options remain short-lived search results assembled from supplier products, rates, and availability. They do not require a permanent table; selecting one creates the durable booking record.
