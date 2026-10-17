@@ -2,6 +2,7 @@
 title: "How does Chrome know the server is really yifanzhai.com?"
 description: "Inspecting a real certificate, following its trust chain, and breaking one validation check at a time to see why Chrome trusts—or rejects—an HTTPS server."
 publishedAt: 2026-09-07
+updatedAt: 2026-10-17
 tags: [tls, certificates, security]
 draft: false
 ---
@@ -319,6 +320,46 @@ When Chrome later connects, it does not repeat the CA's domain-control challenge
 | Chrome | Does this certificate and handshake satisfy my rules for the hostname the user requested? |
 
 For a normal domain-validated certificate, this proves only that the server is authorized to represent the requested domain and possesses the certificate’s private key. It does not prove that the website itself is trustworthy or safe.
+
+## What if a trusted CA is compromised?
+
+An interview can start with “How does TLS work?” and then follow the trust chain to a harder question: what if an attacker steals an intermediate CA's signing private key?
+
+This is different from copying a public certificate. The attacker can create a new key pair and use the stolen CA key to sign a certificate binding the attacker's public key to `yifanzhai.com`, provided the issuer's constraints permit that name and use. Stealing an ordinary leaf key does not grant CA signing authority: the leaf above has `CA:FALSE`.
+
+If the attacker can also redirect the victim's connection, the resulting handshake may look internally consistent:
+
+```text
+forged certificate
+    names yifanzhai.com and contains the attacker's public key
+    carries a valid signature from the compromised CA
+
+CertificateVerify
+    signed with the attacker's matching private key
+    correctly covers the attacker's handshake with the victim
+```
+
+The signature mathematics have not failed. The authority making the identity claim has failed. The certificate could pass chain, hostname, and key-possession checks; browser policy checks still apply. `CertificateVerify` proves possession of a key, not that the CA was right to authorize it.
+
+### Revoke trust and make unexpected issuance visible
+
+Revocation lets clients reject affected certificates before expiry. For a compromised issuer, browsers can also block the issuer or change their trust policies. Protection depends on the client receiving and enforcing the relevant information; it is not enough to publish a revocation somewhere. Chrome's [CRLSet documentation](https://www.chromium.org/Home/chromium-security/crlsets/) describes its mechanism and coverage limits, so “Chrome downloads every CA's revocation list on every connection” is not an accurate model.
+
+Certificate Transparency, introduced above, helps domain owners and monitors discover unexpected certificates. A fraudulent certificate can still be logged: visibility supports detection and response, but logging alone does not make issuance legitimate.
+
+### Add an expected certificate or public key
+
+Certificate pinning adds a client-side expectation beyond ordinary certificate validation. A client might require the server's exact certificate, or use public key pinning to require a hash of an expected public key's SubjectPublicKeyInfo (SPKI).
+
+For example, an application can ship with the expected service key's hash. It first validates the certificate and hostname, then checks the pin. A forged certificate containing the attacker's different key fails that additional check, even before revocation information arrives.
+
+The pin must already be trusted. Learning it from an attacker-controlled first connection would preserve the attacker's key instead. Pinning only the compromised intermediate CA would also accept the forged chain. And if the attacker steals the private key corresponding to the pinned service key itself, the pin cannot distinguish that attacker from the service.
+
+### Pinning has an operational cost
+
+Pinning an exact certificate requires planning for certificate replacement. Pinning a public key can survive renewal with that same key, but key rotation still requires coordinated pin updates and recovery options. An outdated pin can block legitimate clients. [OWASP's pinning guidance](https://owasp.org/www-community/controls/Certificate_and_Public_Key_Pinning) therefore discourages routine adoption and limits suitable use cases to carefully managed clients and servers under the same party's control.
+
+For this article's Chrome context, application pinning must be distinguished from HTTP Public Key Pinning (HPKP). Chrome no longer supports dynamic HPKP configured through a website's HTTP response headers; Chromium documents that distinction from its limited preloaded pins in its [pinning implementation update](https://groups.google.com/a/chromium.org/g/embedder-dev/c/XsNTwEiN1lI). Pinning is a useful answer to this interview threat model, not a general instruction to add an HPKP header to a website.
 
 ## What the browser knows—and what it does not
 
