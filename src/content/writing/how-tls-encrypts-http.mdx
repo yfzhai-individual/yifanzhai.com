@@ -2,6 +2,7 @@
 title: "How does TLS turn a trusted certificate into encrypted HTTP?"
 description: "Watching a real TLS 1.3 handshake to see how authentication, ephemeral key agreement, and symmetric encryption create a secure HTTPS connection."
 publishedAt: 2026-09-08
+updatedAt: 2026-10-17
 tags: [tls, encryption, security]
 draft: false
 ---
@@ -213,6 +214,10 @@ CertificateVerify
 The signature covers the handshake transcript, including the key-agreement messages. The browser therefore checks more than "this is a valid certificate." It checks that the holder of that certificate participated in this exact handshake.
 
 If an attacker changes a key share or negotiation parameter, the transcript changes and the signature verification fails.
+
+<Callout type="interview" title="What if a trusted CA is compromised?">
+An attacker with a CA's signing private key could issue a certificate for the target hostname and the attacker's own public key, within the CA's constraints. The attacker can then produce a valid `CertificateVerify` with the matching private key. The handshake still depends on correct CA authorization. The [certificate investigation explains revocation, Certificate Transparency, and certificate or public key pinning](/writing/how-does-chrome-know-if-the-server-is-trustworthy/#what-if-a-trusted-ca-is-compromised), including why pinning an expected service key can reject this forged certificate. Forward secrecy addresses later decryption of recorded sessions; it does not prevent this active impersonation.
+</Callout>
 
 ## Step 3: turn one secret into several keys
 
